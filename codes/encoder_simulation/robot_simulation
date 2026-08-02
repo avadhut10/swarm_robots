@@ -1,0 +1,1252 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from matplotlib.patches import Rectangle, FancyBboxPatch, FancyArrowPatch, Circle, Polygon
+from matplotlib.widgets import Button, TextBox
+from scipy.spatial.distance import euclidean
+import itertools
+from collections import defaultdict
+
+class KalmanFilter:
+    """Kalman filter for smooth position tracking"""
+    def __init__(self, dt=0.1):
+        self.dt = dt
+        self.state = np.zeros(4)
+        
+        self.F = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+        
+        self.H = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ])
+        
+        self.Q = np.eye(4) * 0.05
+        self.R = np.eye(2) * 0.3
+        self.P = np.eye(4) * 1.0
+        
+    def predict(self):
+        self.state = self.F @ self.state
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        return self.state[:2]
+    
+    def update(self, measurement):
+        y = measurement - self.H @ self.state
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        
+        self.state = self.state + K @ y
+        self.P = (np.eye(4) - K @ self.H) @ self.P
+        
+        return self.state[:2]
+    
+    def set_initial_state(self, position, velocity=None):
+        self.state[:2] = position
+        if velocity is not None:
+            self.state[2:] = velocity
+        else:
+            self.state[2:] = 0
+
+
+class CollisionAvoidance:
+    """Enhanced collision avoidance with obstacle support"""
+    
+    @staticmethod
+    def compute_avoidance_force(robot_pos, robot_vel, other_robots, obstacles,
+                                safety_radius=2.0, max_force=15.0):
+        avoidance_force = np.zeros(2)
+        
+        # Robot-robot avoidance
+        for other in other_robots:
+            diff = np.array(robot_pos) - np.array(other['pos'])
+            dist = np.linalg.norm(diff)
+            
+            if dist < 0.01:
+                diff = np.array([0.1, 0.1])
+                dist = 0.14
+            
+            rel_vel = np.array(robot_vel) - np.array(other.get('velocity', [0, 0]))
+            
+            if dist < safety_radius * 3:
+                rel_speed = np.linalg.norm(rel_vel)
+                if rel_speed > 0.01:
+                    t_closest = -np.dot(diff, rel_vel) / (rel_speed ** 2)
+                    t_closest = max(0, t_closest)
+                    closest_dist = np.linalg.norm(diff + rel_vel * t_closest)
+                    
+                    if closest_dist < safety_radius:
+                        if dist > 0:
+                            away_dir = diff / dist
+                        else:
+                            away_dir = np.array([1.0, 0.0])
+                        
+                        if dist < safety_radius:
+                            force_mag = max_force * 2
+                        elif closest_dist < safety_radius * 0.5:
+                            force_mag = max_force * (1 - closest_dist / safety_radius)
+                        else:
+                            force_mag = max_force * 0.3 * (1 - closest_dist / safety_radius)
+                        
+                        perp_dir = np.array([-diff[1], diff[0]])
+                        if dist > 0:
+                            perp_dir = perp_dir / dist
+                        
+                        avoidance_force += away_dir * force_mag * 0.7
+                        
+                        perp_component = np.dot(rel_vel, perp_dir)
+                        if abs(perp_component) < 0.5:
+                            perp_force = perp_dir * force_mag * 0.3
+                            avoidance_force += perp_force
+                
+                if dist < safety_radius:
+                    repulsion = (diff / dist) * max_force * (safety_radius - dist) / safety_radius
+                    avoidance_force += repulsion * 3
+        
+        # Robot-obstacle avoidance
+        for obs in obstacles:
+            if obs.get('moving', False):
+                obs_pos = obs['pos']
+                obs_vel = obs.get('velocity', [0, 0])
+            else:
+                obs_pos = obs['center'] if 'center' in obs else obs['pos']
+                obs_vel = [0, 0]
+            
+            diff = np.array(robot_pos) - np.array(obs_pos)
+            dist = np.linalg.norm(diff)
+            obs_radius = obs.get('radius', obs.get('size', 1.0))
+            safe_dist = obs_radius + safety_radius
+            
+            if dist < safe_dist * 2:
+                if dist < 0.01:
+                    diff = np.array([0.1, 0.1])
+                    dist = 0.14
+                
+                rel_vel = np.array(robot_vel) - np.array(obs_vel)
+                
+                if np.linalg.norm(rel_vel) > 0.01:
+                    t_closest = -np.dot(diff, rel_vel) / (np.linalg.norm(rel_vel) ** 2)
+                    t_closest = max(0, t_closest)
+                    closest_dist = np.linalg.norm(diff + rel_vel * t_closest)
+                    
+                    if closest_dist < safe_dist:
+                        away_dir = diff / dist
+                        
+                        if dist < safe_dist:
+                            force_mag = max_force * 2.5
+                        else:
+                            force_mag = max_force * (1 - closest_dist / safe_dist) * 1.5
+                        
+                        avoidance_force += away_dir * force_mag
+                        
+                        # Add tangential component to slide along obstacle
+                        tangent = np.array([-away_dir[1], away_dir[0]])
+                        tangent_component = np.dot(rel_vel, tangent)
+                        avoidance_force += tangent * tangent_component * 0.3
+        
+        # Limit maximum force
+        force_mag = np.linalg.norm(avoidance_force)
+        if force_mag > max_force * 3:
+            avoidance_force = avoidance_force / force_mag * max_force * 3
+        
+        return avoidance_force
+    
+    @staticmethod
+    def check_obstacle_collision(pos, obstacles):
+        """Check if a point collides with any obstacle"""
+        for obs in obstacles:
+            if obs.get('moving', False):
+                obs_pos = obs['pos']
+                obs_radius = obs.get('radius', 1.0)
+            else:
+                obs_pos = obs['center'] if 'center' in obs else obs['pos']
+                obs_radius = obs.get('radius', obs.get('size', 1.0))
+            
+            dist = euclidean(pos, obs_pos)
+            if dist < obs_radius + 0.5:
+                return True
+        return False
+    
+    @staticmethod
+    def line_intersects_obstacle(p1, p2, obstacles):
+        """Check if a line segment intersects any obstacle"""
+        for obs in obstacles:
+            if obs.get('moving', False):
+                obs_pos = obs['pos']
+                obs_radius = obs.get('radius', 1.0)
+            else:
+                obs_pos = obs['center'] if 'center' in obs else obs['pos']
+                obs_radius = obs.get('radius', obs.get('size', 1.0))
+            
+            # Calculate distance from point to line segment
+            p1_arr = np.array(p1)
+            p2_arr = np.array(p2)
+            obs_arr = np.array(obs_pos)
+            
+            line_vec = p2_arr - p1_arr
+            point_vec = obs_arr - p1_arr
+            line_len = np.linalg.norm(line_vec)
+            
+            if line_len < 0.01:
+                return np.linalg.norm(point_vec) < obs_radius + 0.3
+            
+            line_unit = line_vec / line_len
+            projection = np.dot(point_vec, line_unit)
+            projection = np.clip(projection, 0, line_len)
+            
+            closest_point = p1_arr + line_unit * projection
+            dist = np.linalg.norm(obs_arr - closest_point)
+            
+            if dist < obs_radius + 0.3:
+                return True
+        return False
+
+
+class MultiRobotJobSimulation:
+    def __init__(self, boundary_size=(30, 30)):
+        self.boundary_width, self.boundary_height = boundary_size
+        
+        # Multiple robots
+        self.robots = [
+            {
+                'id': 'R1',
+                'start': (5, 5),
+                'end': (25, 25),
+                'pos': [5, 5],
+                'target_pos': [5, 5],
+                'color': '#3498DB',
+                'path': [],
+                'waypoints': [],
+                'current_waypoint': 0,
+                'total_distance': 0,
+                'assigned_jobs': [],
+                'kf': KalmanFilter(dt=0.05),
+                'moving': False,
+                'velocity': [0, 0],
+                'speed': 8.0,
+                'avoidance_force': [0, 0],
+                'safety_radius': 1.5
+            },
+            {
+                'id': 'R2',
+                'start': (25, 5),
+                'end': (5, 25),
+                'pos': [25, 5],
+                'target_pos': [25, 5],
+                'color': '#E74C3C',
+                'path': [],
+                'waypoints': [],
+                'current_waypoint': 0,
+                'total_distance': 0,
+                'assigned_jobs': [],
+                'kf': KalmanFilter(dt=0.05),
+                'moving': False,
+                'velocity': [0, 0],
+                'speed': 8.0,
+                'avoidance_force': [0, 0],
+                'safety_radius': 1.5
+            }
+        ]
+        
+        self.selected_robot = 0
+        self.jobs = []
+        self.next_job_id = 1
+        
+        # Obstacles
+        self.obstacles = []
+        self.next_obs_id = 1
+        
+        self.mode = 'add_job'  # 'add_job', 'set_start', 'set_end', 'move_job', 'add_obstacle', 'move_obstacle'
+        self.selected_job_idx = None
+        self.selected_obs_idx = None
+        self.animating = False
+        self.simulation_time = 0
+        
+        # Collision avoidance
+        self.collision_avoidance_enabled = True
+        self.show_safety_zones = True
+        
+        # Setup figure
+        self.fig = plt.figure(figsize=(18, 10))
+        
+        # Main plot
+        self.ax = self.fig.add_axes([0.04, 0.08, 0.68, 0.88])
+        self.ax.set_xlim(-2, self.boundary_width + 2)
+        self.ax.set_ylim(-2, self.boundary_height + 2)
+        self.ax.set_aspect('equal')
+        self.ax.grid(True, alpha=0.2, linestyle='--')
+        self.ax.set_title('Multi-Robot with Obstacles, Collision Avoidance & Kalman Filter', 
+                         fontsize=14, fontweight='bold', pad=15)
+        
+        # Draw boundary
+        boundary = Rectangle((0, 0), self.boundary_width, self.boundary_height,
+                            fill=True, facecolor='#F5F5F5', edgecolor='#2C3E50', 
+                            linewidth=3, alpha=0.5)
+        self.ax.add_patch(boundary)
+        
+        # Grid lines
+        for i in range(0, self.boundary_width + 1, 5):
+            self.ax.axvline(x=i, color='#DDD', alpha=0.3, linewidth=0.5)
+            self.ax.axhline(y=i, color='#DDD', alpha=0.3, linewidth=0.5)
+        
+        # Legend
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='#27AE60', label='Start'),
+            Patch(facecolor='#E74C3C', label='End'),
+            Patch(facecolor='#F39C12', label='Job'),
+            Patch(facecolor='#8B4513', label='Obstacle'),
+            Patch(facecolor='#E67E22', label='Dynamic Obstacle'),
+            plt.Line2D([0], [0], color='red', linestyle='--', linewidth=0.5, alpha=0.5, label='Safety Zone'),
+        ]
+        for robot in self.robots:
+            legend_elements.append(Patch(facecolor=robot['color'], 
+                                        label=f'Robot {robot["id"]}'))
+        self.ax.legend(handles=legend_elements, loc='upper right', 
+                      fontsize=7, framealpha=0.9)
+        
+        # Instruction text
+        self.instruction = self.ax.text(
+            self.boundary_width/2, -1.5,
+            'Mode: Add Job | Selected: R1 | Click on map',
+            ha='center', fontsize=10, fontweight='bold', color='#E74C3C',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='white', 
+                     edgecolor='#E74C3C', alpha=0.9)
+        )
+        
+        # Click handler
+        self.fig.canvas.mpl_connect('button_press_event', self.on_click)
+        
+        # Create UI
+        self.create_ui()
+        
+        # Add initial obstacles
+        self.add_initial_obstacles()
+        
+        # Initialize Kalman filters
+        for robot in self.robots:
+            robot['kf'].set_initial_state(robot['start'])
+        
+        # Initial draw
+        self.draw_all()
+        self.update_status()
+    
+    def add_initial_obstacles(self):
+        """Add some initial obstacles"""
+        static_obstacles = [
+            {'center': (10, 15), 'size': 1.5, 'shape': 'circle'},
+            {'center': (20, 10), 'size': 1.2, 'shape': 'circle'},
+            {'center': (15, 20), 'size': 1.0, 'shape': 'rectangle', 'width': 3, 'height': 1},
+        ]
+        
+        for obs in static_obstacles:
+            self.obstacles.append({
+                'id': f'OBS{self.next_obs_id}',
+                'type': 'static',
+                'center': obs['center'],
+                'size': obs.get('size', 1.0),
+                'radius': obs.get('size', 1.0),
+                'shape': obs.get('shape', 'circle'),
+                'width': obs.get('width', obs.get('size', 1.0) * 2),
+                'height': obs.get('height', obs.get('size', 1.0) * 2),
+                'color': '#8B4513',
+                'alpha': 0.7,
+                'moving': False
+            })
+            self.next_obs_id += 1
+    
+    def create_ui(self):
+        """Create all UI elements"""
+        x = 0.76
+        w = 0.20
+        h = 0.035
+        y_start = 0.92
+        
+        # === ROBOT SELECTION ===
+        self.fig.text(x + w/2, y_start + 0.02, '🤖 SELECT ROBOT', 
+                     ha='center', fontsize=10, fontweight='bold', fontfamily='monospace')
+        
+        self.robot_buttons = []
+        for i in range(4):
+            y = y_start - 0.04 - i * 0.04
+            ax_btn = self.fig.add_axes([x, y, w, h])
+            
+            if i < len(self.robots):
+                label = f'Robot {self.robots[i]["id"]}'
+                color = self.robots[i]['color']
+            else:
+                label = f'Robot {i+1} (Empty)'
+                color = '#BDC3C7'
+            
+            btn = Button(ax_btn, label, color=color, hovercolor=color)
+            btn.label.set_fontsize(8)
+            btn.on_clicked(lambda event, idx=i: self.select_robot(idx))
+            self.robot_buttons.append(btn)
+        
+        # Add/Remove robots
+        y = y_start - 0.22
+        ax_add = self.fig.add_axes([x, y, w/2 - 0.01, h])
+        btn_add = Button(ax_add, '+ Add', color='#2ECC71', hovercolor='#27AE60')
+        btn_add.label.set_fontsize(8)
+        btn_add.on_clicked(self.add_robot)
+        
+        ax_rem = self.fig.add_axes([x + w/2 + 0.01, y, w/2 - 0.01, h])
+        btn_rem = Button(ax_rem, '- Remove', color='#E74C3C', hovercolor='#C0392B')
+        btn_rem.label.set_fontsize(8)
+        btn_rem.on_clicked(self.remove_robot)
+        
+        # === CLICK MODE ===
+        y = y_start - 0.30
+        self.fig.text(x + w/2, y + 0.02, '📍 CLICK MODE', 
+                     ha='center', fontsize=10, fontweight='bold', fontfamily='monospace')
+        
+        modes = [
+            ('📦 Add Job', 'add_job', '#F39C12'),
+            ('🚀 Set Start', 'set_start', '#27AE60'),
+            ('🏁 Set End', 'set_end', '#E74C3C'),
+            ('🔄 Move Job', 'move_job', '#9B59B6'),
+            ('🧱 Add Obstacle', 'add_obstacle', '#8B4513'),
+            ('🔄 Move Obstacle', 'move_obstacle', '#A0522D')
+        ]
+        
+        self.mode_buttons = {}
+        for label, mode, color in modes:
+            y -= 0.035
+            ax_btn = self.fig.add_axes([x, y, w, h])
+            btn = Button(ax_btn, label, color=color, hovercolor=color)
+            btn.label.set_fontsize(7)
+            btn.on_clicked(lambda event, m=mode: self.set_mode(m))
+            self.mode_buttons[mode] = btn
+        
+        # === OBSTACLE CONTROLS ===
+        y -= 0.04
+        self.fig.text(x + w/2, y + 0.02, '🧱 OBSTACLES', 
+                     ha='center', fontsize=10, fontweight='bold', fontfamily='monospace')
+        
+        obstacle_actions = [
+            ('➕ Static', '#8B4513', 'add_static'),
+            ('🏃 Dynamic', '#E67E22', 'add_dynamic'),
+            ('🗑️ Clear All', '#C0392B', 'clear_obstacles')
+        ]
+        
+        for label, color, key in obstacle_actions:
+            y -= 0.035
+            ax_btn = self.fig.add_axes([x, y, w, h])
+            btn = Button(ax_btn, label, color=color, hovercolor=color)
+            btn.label.set_fontsize(7)
+            if key == 'add_static':
+                btn.on_clicked(self.add_static_obstacle)
+            elif key == 'add_dynamic':
+                btn.on_clicked(self.add_dynamic_obstacle)
+            elif key == 'clear_obstacles':
+                btn.on_clicked(self.clear_obstacles)
+        
+        # === COLLISION AVOIDANCE ===
+        y -= 0.04
+        self.fig.text(x + w/2, y + 0.02, '🛡️ COLLISION AVOIDANCE', 
+                     ha='center', fontsize=10, fontweight='bold', fontfamily='monospace')
+        
+        y -= 0.035
+        ax_collision = self.fig.add_axes([x, y, w, h])
+        self.collision_btn = Button(ax_collision, '✅ Enabled', 
+                                    color='#2ECC71', hovercolor='#27AE60')
+        self.collision_btn.label.set_fontsize(8)
+        self.collision_btn.on_clicked(self.toggle_collision_avoidance)
+        
+        y -= 0.035
+        ax_safety = self.fig.add_axes([x, y, w, h])
+        self.safety_btn = Button(ax_safety, '👁️ Show Zones', 
+                                 color='#3498DB', hovercolor='#2980B9')
+        self.safety_btn.label.set_fontsize(8)
+        self.safety_btn.on_clicked(self.toggle_safety_zones)
+        
+        # === ACTIONS ===
+        y -= 0.04
+        self.fig.text(x + w/2, y + 0.02, '⚡ ACTIONS', 
+                     ha='center', fontsize=10, fontweight='bold', fontfamily='monospace')
+        
+        actions = [
+            ('🔄 Calculate Paths', '#3498DB', 'calc'),
+            ('▶️ Start Animation', '#2ECC71', 'anim'),
+            ('🔄 Reset All', '#95A5A6', 'reset'),
+            ('🗑️ Clear Jobs', '#E67E22', 'clear')
+        ]
+        
+        self.action_buttons = {}
+        for label, color, key in actions:
+            y -= 0.035
+            ax_btn = self.fig.add_axes([x, y, w, h])
+            btn = Button(ax_btn, label, color=color, hovercolor=color)
+            btn.label.set_fontsize(7)
+            self.action_buttons[key] = btn
+        
+        self.action_buttons['calc'].on_clicked(self.calculate_all_paths)
+        self.action_buttons['anim'].on_clicked(self.toggle_animation)
+        self.action_buttons['reset'].on_clicked(self.reset_all)
+        self.action_buttons['clear'].on_clicked(self.clear_jobs)
+        
+        # === STATUS ===
+        self.status_text = self.fig.text(x, 0.02, '', fontsize=6.5, 
+                                         fontfamily='monospace', va='bottom')
+    
+    def toggle_collision_avoidance(self, event):
+        self.collision_avoidance_enabled = not self.collision_avoidance_enabled
+        if self.collision_avoidance_enabled:
+            self.collision_btn.label.set_text('✅ Enabled')
+            self.collision_btn.ax.set_facecolor('#2ECC71')
+        else:
+            self.collision_btn.label.set_text('❌ Disabled')
+            self.collision_btn.ax.set_facecolor('#E74C3C')
+        self.update_status()
+    
+    def toggle_safety_zones(self, event):
+        self.show_safety_zones = not self.show_safety_zones
+        if self.show_safety_zones:
+            self.safety_btn.label.set_text('👁️ Show Zones')
+            self.safety_btn.ax.set_facecolor('#3498DB')
+        else:
+            self.safety_btn.label.set_text('🙈 Hide Zones')
+            self.safety_btn.ax.set_facecolor('#7F8C8D')
+        self.draw_all()
+    
+    def add_static_obstacle(self, event):
+        """Add a random static obstacle"""
+        x = np.random.uniform(5, self.boundary_width - 5)
+        y = np.random.uniform(5, self.boundary_height - 5)
+        size = np.random.uniform(0.8, 2.0)
+        
+        self.obstacles.append({
+            'id': f'OBS{self.next_obs_id}',
+            'type': 'static',
+            'center': (x, y),
+            'size': size,
+            'radius': size,
+            'shape': 'circle',
+            'width': size * 2,
+            'height': size * 2,
+            'color': '#8B4513',
+            'alpha': 0.7,
+            'moving': False
+        })
+        self.next_obs_id += 1
+        self.draw_all()
+        self.update_status()
+    
+    def add_dynamic_obstacle(self, event):
+        """Add a random dynamic (moving) obstacle"""
+        x = np.random.uniform(5, self.boundary_width - 5)
+        y = np.random.uniform(5, self.boundary_height - 5)
+        
+        self.obstacles.append({
+            'id': f'OBS{self.next_obs_id}',
+            'type': 'dynamic',
+            'pos': [x, y],
+            'center': (x, y),
+            'size': 0.8,
+            'radius': 0.8,
+            'shape': 'circle',
+            'color': '#E67E22',
+            'alpha': 0.8,
+            'moving': True,
+            'velocity': [np.random.uniform(-3, 3), np.random.uniform(-3, 3)],
+            'patrol_range': np.random.uniform(3, 8)
+        })
+        self.next_obs_id += 1
+        self.draw_all()
+        self.update_status()
+    
+    def clear_obstacles(self, event):
+        """Clear all obstacles"""
+        self.obstacles.clear()
+        self.next_obs_id = 1
+        self.draw_all()
+        self.update_status()
+    
+    def select_robot(self, idx):
+        if idx < len(self.robots):
+            self.selected_robot = idx
+            self.update_robot_buttons()
+            self.update_instruction()
+    
+    def update_robot_buttons(self):
+        for i, btn in enumerate(self.robot_buttons):
+            if i < len(self.robots):
+                btn.label.set_text(f'Robot {self.robots[i]["id"]}')
+                if i == self.selected_robot:
+                    btn.ax.set_facecolor(self.robots[i]['color'])
+                else:
+                    btn.ax.set_facecolor('#BDC3C7')
+            else:
+                btn.label.set_text(f'Robot {i+1} (Empty)')
+                btn.ax.set_facecolor('#ECF0F1')
+    
+    def add_robot(self, event):
+        if len(self.robots) >= 4:
+            return
+        
+        colors = ['#3498DB', '#E74C3C', '#2ECC71', '#F39C12']
+        robot_id = f'R{len(self.robots) + 1}'
+        
+        start_pos = (np.random.uniform(2, self.boundary_width-2),
+                    np.random.uniform(2, self.boundary_height-2))
+        end_pos = (np.random.uniform(2, self.boundary_width-2),
+                  np.random.uniform(2, self.boundary_height-2))
+        
+        new_robot = {
+            'id': robot_id,
+            'start': start_pos,
+            'end': end_pos,
+            'pos': list(start_pos),
+            'target_pos': list(start_pos),
+            'color': colors[len(self.robots)],
+            'path': [],
+            'waypoints': [],
+            'current_waypoint': 0,
+            'total_distance': 0,
+            'assigned_jobs': [],
+            'kf': KalmanFilter(dt=0.05),
+            'moving': False,
+            'velocity': [0, 0],
+            'speed': 8.0,
+            'avoidance_force': [0, 0],
+            'safety_radius': 1.5
+        }
+        new_robot['kf'].set_initial_state(start_pos)
+        self.robots.append(new_robot)
+        
+        self.update_robot_buttons()
+        self.draw_all()
+        self.update_status()
+    
+    def remove_robot(self, event):
+        if len(self.robots) <= 1:
+            return
+        
+        self.robots.pop(self.selected_robot)
+        self.selected_robot = min(self.selected_robot, len(self.robots) - 1)
+        
+        self.update_robot_buttons()
+        self.update_instruction()
+        self.draw_all()
+        self.update_status()
+    
+    def set_mode(self, mode):
+        self.mode = mode
+        self.selected_job_idx = None
+        self.selected_obs_idx = None
+        self.update_instruction()
+    
+    def update_instruction(self):
+        robot_id = self.robots[self.selected_robot]['id']
+        mode_texts = {
+            'add_job': f'Mode: Add Job | Selected: {robot_id} | Click on map',
+            'set_start': f'Mode: Set Start | Selected: {robot_id} | Click start',
+            'set_end': f'Mode: Set End | Selected: {robot_id} | Click end',
+            'move_job': f'Mode: Move Job | Selected: {robot_id} | Click job then new pos',
+            'add_obstacle': f'Mode: Add Obstacle | Click to place obstacle',
+            'move_obstacle': f'Mode: Move Obstacle | Click obstacle then new pos'
+        }
+        self.instruction.set_text(mode_texts[self.mode])
+        self.fig.canvas.draw_idle()
+    
+    def on_click(self, event):
+        if event.inaxes != self.ax:
+            return
+        
+        x, y = event.xdata, event.ydata
+        if not (0 <= x <= self.boundary_width and 0 <= y <= self.boundary_height):
+            return
+        
+        x, y = round(x, 1), round(y, 1)
+        
+        if self.mode == 'add_job':
+            # Don't add jobs on obstacles
+            if not CollisionAvoidance.check_obstacle_collision((x, y), self.obstacles):
+                self.add_job(x, y)
+        elif self.mode == 'add_obstacle':
+            self.add_obstacle_at(x, y)
+        elif self.mode == 'set_start':
+            if not CollisionAvoidance.check_obstacle_collision((x, y), self.obstacles):
+                robot = self.robots[self.selected_robot]
+                robot['start'] = (x, y)
+                robot['pos'] = [x, y]
+                robot['target_pos'] = [x, y]
+                robot['kf'].set_initial_state([x, y])
+                self.draw_all()
+                self.update_status()
+        elif self.mode == 'set_end':
+            if not CollisionAvoidance.check_obstacle_collision((x, y), self.obstacles):
+                self.robots[self.selected_robot]['end'] = (x, y)
+                self.draw_all()
+                self.update_status()
+        elif self.mode == 'move_job':
+            self.handle_move_job(x, y)
+        elif self.mode == 'move_obstacle':
+            self.handle_move_obstacle(x, y)
+    
+    def add_job(self, x, y):
+        for job in self.jobs:
+            if euclidean((x, y), job['pos']) < 1.0:
+                return
+        
+        colors = ['#E74C3C', '#3498DB', '#2ECC71', '#F39C12', '#9B59B6',
+                  '#1ABC9C', '#E67E22', '#16A085', '#C0392B', '#8E44AD']
+        
+        job = {
+            'id': f'J{self.next_job_id}',
+            'pos': (x, y),
+            'color': colors[(self.next_job_id - 1) % len(colors)],
+            'picked': False,
+            'assigned_to': None
+        }
+        self.jobs.append(job)
+        self.next_job_id += 1
+        self.draw_all()
+        self.update_status()
+    
+    def add_obstacle_at(self, x, y):
+        """Add obstacle at clicked position"""
+        for obs in self.obstacles:
+            if euclidean((x, y), obs.get('center', obs.get('pos', (0, 0)))) < 2.0:
+                return
+        
+        self.obstacles.append({
+            'id': f'OBS{self.next_obs_id}',
+            'type': 'static',
+            'center': (x, y),
+            'size': 1.2,
+            'radius': 1.2,
+            'shape': 'circle',
+            'width': 2.4,
+            'height': 2.4,
+            'color': '#8B4513',
+            'alpha': 0.7,
+            'moving': False
+        })
+        self.next_obs_id += 1
+        self.draw_all()
+        self.update_status()
+    
+    def handle_move_job(self, x, y):
+        if self.selected_job_idx is None:
+            for i, job in enumerate(self.jobs):
+                if euclidean((x, y), job['pos']) < 1.0:
+                    self.selected_job_idx = i
+                    self.instruction.set_text(f'Selected {job["id"]} | Click new location')
+                    self.fig.canvas.draw_idle()
+                    return
+        else:
+            if not CollisionAvoidance.check_obstacle_collision((x, y), self.obstacles):
+                self.jobs[self.selected_job_idx]['pos'] = (x, y)
+                self.selected_job_idx = None
+                self.set_mode('add_job')
+                self.draw_all()
+                self.update_status()
+    
+    def handle_move_obstacle(self, x, y):
+        if self.selected_obs_idx is None:
+            for i, obs in enumerate(self.obstacles):
+                obs_pos = obs.get('center', obs.get('pos', (0, 0)))
+                if euclidean((x, y), obs_pos) < obs.get('radius', 1.0) + 0.5:
+                    self.selected_obs_idx = i
+                    self.instruction.set_text(f'Selected {obs["id"]} | Click new location')
+                    self.fig.canvas.draw_idle()
+                    return
+        else:
+            obs = self.obstacles[self.selected_obs_idx]
+            if obs['moving']:
+                obs['pos'] = [x, y]
+            else:
+                obs['center'] = (x, y)
+            self.selected_obs_idx = None
+            self.set_mode('add_job')
+            self.draw_all()
+            self.update_status()
+    
+    def quick_add_jobs(self, text):
+        try:
+            num = int(text)
+            for _ in range(min(num, 20)):
+                x = np.random.uniform(3, self.boundary_width - 3)
+                y = np.random.uniform(3, self.boundary_height - 3)
+                if not CollisionAvoidance.check_obstacle_collision((x, y), self.obstacles):
+                    self.add_job(round(x, 1), round(y, 1))
+        except ValueError:
+            pass
+    
+    def clear_jobs(self, event):
+        self.jobs.clear()
+        self.next_job_id = 1
+        for robot in self.robots:
+            robot['path'] = []
+            robot['waypoints'] = []
+            robot['total_distance'] = 0
+            robot['assigned_jobs'] = []
+            robot['moving'] = False
+        self.draw_all()
+        self.update_status()
+    
+    def assign_jobs_to_robots(self):
+        for job in self.jobs:
+            job['assigned_to'] = None
+        
+        if not self.jobs:
+            return
+        
+        distances = []
+        for j_idx, job in enumerate(self.jobs):
+            for r_idx, robot in enumerate(self.robots):
+                dist = euclidean(job['pos'], robot['start'])
+                # Penalize if path crosses obstacles
+                if CollisionAvoidance.line_intersects_obstacle(robot['start'], job['pos'], self.obstacles):
+                    dist *= 2
+                distances.append((dist, j_idx, r_idx))
+        
+        distances.sort()
+        
+        assigned_jobs = set()
+        robot_counts = defaultdict(int)
+        max_per_robot = max(1, len(self.jobs) // len(self.robots) + 1)
+        
+        for dist, j_idx, r_idx in distances:
+            if j_idx not in assigned_jobs and robot_counts[r_idx] < max_per_robot:
+                self.jobs[j_idx]['assigned_to'] = r_idx
+                assigned_jobs.add(j_idx)
+                robot_counts[r_idx] += 1
+        
+        for j_idx in range(len(self.jobs)):
+            if j_idx not in assigned_jobs:
+                min_robot = min(range(len(self.robots)), 
+                              key=lambda r: robot_counts[r])
+                self.jobs[j_idx]['assigned_to'] = min_robot
+                robot_counts[min_robot] += 1
+    
+    def calculate_shortest_path(self, robot_idx):
+        """Calculate shortest path avoiding obstacles"""
+        robot = self.robots[robot_idx]
+        assigned = [j for j in self.jobs if j['assigned_to'] == robot_idx]
+        
+        if not assigned:
+            path = [robot['start'], robot['end']]
+            robot['path'] = path
+            robot['waypoints'] = path
+            robot['total_distance'] = euclidean(robot['start'], robot['end'])
+            robot['assigned_jobs'] = []
+            return
+        
+        positions = [j['pos'] for j in assigned]
+        
+        min_dist = float('inf')
+        best_order = None
+        
+        if len(positions) <= 8:
+            for perm in itertools.permutations(range(len(positions))):
+                dist = 0
+                curr = robot['start']
+                valid_path = True
+                
+                for idx in perm:
+                    # Check if segment crosses obstacles
+                    if CollisionAvoidance.line_intersects_obstacle(curr, positions[idx], self.obstacles):
+                        valid_path = False
+                        break
+                    dist += euclidean(curr, positions[idx])
+                    curr = positions[idx]
+                
+                if valid_path:
+                    if not CollisionAvoidance.line_intersects_obstacle(curr, robot['end'], self.obstacles):
+                        dist += euclidean(curr, robot['end'])
+                        
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_order = list(perm)
+        else:
+            unvisited = list(range(len(positions)))
+            curr = robot['start']
+            best_order = []
+            while unvisited:
+                nearest = min(unvisited, key=lambda i: euclidean(curr, positions[i]))
+                best_order.append(nearest)
+                curr = positions[nearest]
+                unvisited.remove(nearest)
+            
+            min_dist = euclidean(robot['start'], positions[best_order[0]])
+            for i in range(len(best_order)-1):
+                min_dist += euclidean(positions[best_order[i]], positions[best_order[i+1]])
+            min_dist += euclidean(positions[best_order[-1]], robot['end'])
+        
+        if best_order:
+            path = [robot['start']]
+            robot['assigned_jobs'] = []
+            for idx in best_order:
+                path.append(positions[idx])
+                robot['assigned_jobs'].append(assigned[idx])
+            path.append(robot['end'])
+        else:
+            # Fallback path
+            path = [robot['start'], robot['end']]
+            robot['assigned_jobs'] = []
+        
+        robot['path'] = path
+        robot['waypoints'] = path
+        robot['total_distance'] = min_dist
+    
+    def calculate_all_paths(self, event):
+        self.assign_jobs_to_robots()
+        for i in range(len(self.robots)):
+            self.calculate_shortest_path(i)
+        self.draw_all()
+        self.update_status()
+    
+    def check_collisions(self):
+        collisions = []
+        for i in range(len(self.robots)):
+            for j in range(i + 1, len(self.robots)):
+                dist = euclidean(self.robots[i]['pos'], self.robots[j]['pos'])
+                if dist < 1.0:
+                    collisions.append((i, j, dist))
+        
+        # Check obstacle collisions
+        for i, robot in enumerate(self.robots):
+            for obs in self.obstacles:
+                obs_pos = obs.get('center', obs.get('pos', (0, 0)))
+                dist = euclidean(robot['pos'], obs_pos)
+                if dist < obs.get('radius', 1.0) + 0.5:
+                    collisions.append((i, -1, dist))
+        
+        return collisions
+    
+    def toggle_animation(self, event):
+        if self.animating:
+            self.animating = False
+            self.action_buttons['anim'].label.set_text('▶️ Start Animation')
+        else:
+            if not any(r['path'] for r in self.robots):
+                self.calculate_all_paths(None)
+            
+            for robot in self.robots:
+                robot['current_waypoint'] = 0
+                robot['pos'] = list(robot['start'])
+                robot['target_pos'] = list(robot['start'])
+                robot['kf'].set_initial_state(robot['start'])
+                robot['moving'] = False
+                robot['velocity'] = [0, 0]
+                robot['avoidance_force'] = [0, 0]
+            
+            for job in self.jobs:
+                job['picked'] = False
+            
+            self.simulation_time = 0
+            self.animating = True
+            self.action_buttons['anim'].label.set_text('⏸️ Pause Animation')
+    
+    def reset_all(self, event):
+        self.animating = False
+        self.action_buttons['anim'].label.set_text('▶️ Start Animation')
+        
+        for robot in self.robots:
+            robot['pos'] = list(robot['start'])
+            robot['target_pos'] = list(robot['start'])
+            robot['path'] = []
+            robot['waypoints'] = []
+            robot['current_waypoint'] = 0
+            robot['total_distance'] = 0
+            robot['assigned_jobs'] = []
+            robot['kf'].set_initial_state(robot['start'])
+            robot['moving'] = False
+            robot['velocity'] = [0, 0]
+            robot['avoidance_force'] = [0, 0]
+        
+        for job in self.jobs:
+            job['picked'] = False
+            job['assigned_to'] = None
+        
+        self.draw_all()
+        self.update_status()
+    
+    def update_dynamic_obstacles(self, dt):
+        """Update positions of dynamic obstacles"""
+        for obs in self.obstacles:
+            if obs.get('moving', False):
+                # Update position
+                obs['pos'][0] += obs['velocity'][0] * dt
+                obs['pos'][1] += obs['velocity'][1] * dt
+                
+                # Bounce off boundaries
+                if obs['pos'][0] < 1 or obs['pos'][0] > self.boundary_width - 1:
+                    obs['velocity'][0] *= -1
+                if obs['pos'][1] < 1 or obs['pos'][1] > self.boundary_height - 1:
+                    obs['velocity'][1] *= -1
+                
+                # Keep within bounds
+                obs['pos'][0] = np.clip(obs['pos'][0], 1, self.boundary_width - 1)
+                obs['pos'][1] = np.clip(obs['pos'][1], 1, self.boundary_height - 1)
+    
+    def update_animation(self, frame):
+        if not self.animating:
+            return []
+        
+        dt = 0.05
+        self.simulation_time += dt
+        
+        # Update dynamic obstacles
+        self.update_dynamic_obstacles(dt)
+        
+        all_done = True
+        
+        # Compute avoidance forces
+        for robot in self.robots:
+            robot['avoidance_force'] = [0, 0]
+        
+        if self.collision_avoidance_enabled:
+            for i, robot in enumerate(self.robots):
+                if robot['moving']:
+                    other_robots = [self.robots[j] for j in range(len(self.robots)) if j != i]
+                    avoidance = CollisionAvoidance.compute_avoidance_force(
+                        robot['pos'], robot['velocity'], other_robots, self.obstacles,
+                        safety_radius=robot['safety_radius']
+                    )
+                    robot['avoidance_force'] = avoidance.tolist()
+        
+        # Update each robot
+        for robot in self.robots:
+            if not robot['waypoints'] or robot['current_waypoint'] >= len(robot['waypoints']) - 1:
+                robot['moving'] = False
+                robot['velocity'] = [0, 0]
+                continue
+            
+            all_done = False
+            robot['moving'] = True
+            
+            target = np.array(robot['waypoints'][robot['current_waypoint'] + 1])
+            current = np.array(robot['pos'])
+            
+            direction = target - current
+            distance = np.linalg.norm(direction)
+            
+            if distance < 0.5:
+                robot['current_waypoint'] += 1
+                
+                r_idx = self.robots.index(robot)
+                for job in self.jobs:
+                    if (not job['picked'] and job['assigned_to'] == r_idx and 
+                        euclidean(robot['pos'], job['pos']) < 1.0):
+                        job['picked'] = True
+                
+                if robot['current_waypoint'] >= len(robot['waypoints']) - 1:
+                    robot['moving'] = False
+                    robot['velocity'] = [0, 0]
+            else:
+                direction_norm = direction / distance
+                desired_velocity = direction_norm * robot['speed']
+                
+                if self.collision_avoidance_enabled:
+                    avoidance = np.array(robot['avoidance_force'])
+                    combined_velocity = desired_velocity + avoidance
+                    
+                    speed = np.linalg.norm(combined_velocity)
+                    if speed > robot['speed'] * 1.5:
+                        combined_velocity = combined_velocity / speed * robot['speed'] * 1.5
+                    if speed < robot['speed'] * 0.3 and distance > 1.0:
+                        combined_velocity = direction_norm * robot['speed'] * 0.5
+                else:
+                    combined_velocity = desired_velocity
+                
+                robot['kf'].state[2:] = combined_velocity
+                robot['kf'].predict()
+                
+                noise = np.random.normal(0, 0.05, 2)
+                measurement = current + combined_velocity * dt + noise
+                
+                estimated_pos = robot['kf'].update(measurement)
+                
+                # Boundary avoidance
+                estimated_pos[0] = np.clip(estimated_pos[0], 0.5, self.boundary_width - 0.5)
+                estimated_pos[1] = np.clip(estimated_pos[1], 0.5, self.boundary_height - 0.5)
+                
+                robot['pos'] = estimated_pos.tolist()
+                robot['velocity'] = combined_velocity.tolist()
+        
+        if all_done:
+            self.animating = False
+            self.action_buttons['anim'].label.set_text('▶️ Start Animation')
+            for robot in self.robots:
+                robot['moving'] = False
+                robot['velocity'] = [0, 0]
+        
+        self.draw_all()
+        self.update_status()
+        return []
+    
+    def draw_all(self):
+        # Clear
+        for artist in self.ax.collections[:]:
+            artist.remove()
+        for text in self.ax.texts[:]:
+            if text != self.instruction:
+                text.remove()
+        
+        old_patches = [p for p in self.ax.patches 
+                      if not (isinstance(p, Rectangle) and 
+                             p.get_facecolor()[:3] == (0.96, 0.96, 0.96))]
+        for patch in old_patches:
+            patch.remove()
+        
+        # Draw obstacles
+        for obs in self.obstacles:
+            if obs.get('moving', False):
+                pos = obs['pos']
+            else:
+                pos = obs['center']
+            
+            if obs.get('shape') == 'rectangle':
+                rect = Rectangle(
+                    (pos[0] - obs['width']/2, pos[1] - obs['height']/2),
+                    obs['width'], obs['height'],
+                    fill=True, facecolor=obs['color'],
+                    edgecolor='#5D3A1A', linewidth=2,
+                    alpha=obs['alpha'], zorder=2
+                )
+                self.ax.add_patch(rect)
+            else:
+                circle = Circle(pos, obs['radius'],
+                              fill=True, facecolor=obs['color'],
+                              edgecolor='#5D3A1A', linewidth=2,
+                              alpha=obs['alpha'], zorder=2)
+                self.ax.add_patch(circle)
+            
+            # Obstacle label
+            label_color = 'white' if obs.get('moving', False) else '#FFD700'
+            self.ax.text(pos[0], pos[1], obs['id'],
+                        ha='center', va='center', fontsize=6,
+                        fontweight='bold', color=label_color, zorder=3)
+        
+        # Draw safety zones
+        if self.show_safety_zones and self.animating:
+            for robot in self.robots:
+                if robot['moving']:
+                    safety_circle = Circle(robot['pos'], robot['safety_radius'],
+                                          fill=True, facecolor=robot['color'],
+                                          alpha=0.1, edgecolor=robot['color'],
+                                          linewidth=1, linestyle='--', zorder=1)
+                    self.ax.add_patch(safety_circle)
+        
+        # Draw paths
+        for robot in self.robots:
+            if robot['waypoints'] and len(robot['waypoints']) > 1:
+                px = [p[0] for p in robot['waypoints']]
+                py = [p[1] for p in robot['waypoints']]
+                self.ax.plot(px, py, '--', color=robot['color'], 
+                           linewidth=1.5, alpha=0.3, zorder=1)
+                
+                for wp in robot['waypoints'][1:-1]:
+                    self.ax.plot(wp[0], wp[1], 'o', markersize=5,
+                               color=robot['color'], zorder=2)
+        
+        # Draw jobs
+        for job in self.jobs:
+            alpha = 0.3 if job['picked'] else 1.0
+            
+            box = FancyBboxPatch(
+                (job['pos'][0]-0.3, job['pos'][1]-0.3), 0.6, 0.6,
+                boxstyle="round,pad=0.05",
+                facecolor=job['color'], edgecolor='#333',
+                linewidth=2, alpha=alpha, zorder=3
+            )
+            self.ax.add_patch(box)
+            
+            self.ax.text(job['pos'][0], job['pos'][1], job['id'],
+                        ha='center', va='center', fontsize=7,
+                        fontweight='bold', color='white', zorder=4)
+            
+            if job['assigned_to'] is not None:
+                robot = self.robots[job['assigned_to']]
+                self.ax.text(job['pos'][0], job['pos'][1]+0.5,
+                           f'→{robot["id"]}', ha='center', 
+                           fontsize=6, color=robot['color'], fontweight='bold')
+        
+        # Draw robots
+        for robot in self.robots:
+            body = FancyBboxPatch(
+                (robot['pos'][0]-0.5, robot['pos'][1]-0.4), 1.0, 0.8,
+                boxstyle="round,pad=0.1",
+                facecolor=robot['color'], edgecolor='#2C3E50',
+                linewidth=2.5, zorder=5
+            )
+            self.ax.add_patch(body)
+            
+            self.ax.text(robot['pos'][0], robot['pos'][1], robot['id'],
+                        ha='center', va='center', fontsize=9,
+                        fontweight='bold', color='white', zorder=6)
+            
+            if robot['moving'] and np.linalg.norm(robot['velocity']) > 0.1:
+                vel_norm = np.array(robot['velocity'])
+                vel_norm = vel_norm / np.linalg.norm(vel_norm) * 0.6
+                arrow = FancyArrowPatch(
+                    (robot['pos'][0], robot['pos'][1]),
+                    (robot['pos'][0] + vel_norm[0], robot['pos'][1] + vel_norm[1]),
+                    arrowstyle='->', mutation_scale=20,
+                    color='white', linewidth=2.5, zorder=7
+                )
+            else:
+                arrow = FancyArrowPatch(
+                    (robot['pos'][0], robot['pos'][1]),
+                    (robot['pos'][0] + 0.6, robot['pos'][1]),
+                    arrowstyle='->', mutation_scale=20,
+                    color='white', linewidth=2.5, zorder=7
+                )
+            self.ax.add_patch(arrow)
+            
+            # Start marker
+            self.ax.plot(robot['start'][0], robot['start'][1], 'o',
+                        markersize=8, color='#27AE60', markeredgewidth=2,
+                        markeredgecolor='#1E8449', zorder=3)
+            
+            # End marker
+            self.ax.plot(robot['end'][0], robot['end'][1], 'o',
+                        markersize=8, color='#E74C3C', markeredgewidth=2,
+                        markeredgecolor='#C0392B', zorder=3)
+        
+        self.fig.canvas.draw_idle()
+    
+    def update_status(self):
+        status = f'Time: {self.simulation_time:.1f}s | Jobs: {len(self.jobs)} | Obstacles: {len(self.obstacles)}\n'
+        status += f'Collision Avoidance: {"ON" if self.collision_avoidance_enabled else "OFF"}\n'
+        status += '─' * 35 + '\n'
+        
+        for robot in self.robots:
+            jobs_count = len(robot['assigned_jobs'])
+            dist = robot['total_distance']
+            status += f'{robot["id"]}: {jobs_count} jobs, {dist:.1f}m\n'
+        
+        total_dist = sum(r['total_distance'] for r in self.robots)
+        if total_dist > 0:
+            status += f'Total: {total_dist:.1f}m | Picked: {sum(1 for j in self.jobs if j["picked"])}/{len(self.jobs)}'
+        
+        self.status_text.set_text(status)
+        self.fig.canvas.draw_idle()
+    
+    def run(self):
+        self.anim = FuncAnimation(self.fig, self.update_animation,
+                                 frames=None, interval=50, blit=False,
+                                 cache_frame_data=False)
+        plt.show()
+
+
+if __name__ == "__main__":
+    print("=" * 65)
+    print("MULTI-ROBOT WITH OBSTACLES & COLLISION AVOIDANCE")
+    print("=" * 65)
+    print("\n Features:")
+    print("  • Static and dynamic obstacles")
+    print("  • Obstacle-aware path planning")
+    print("  • Collision avoidance with obstacles")
+    print("  • Click to add/move obstacles")
+    print("  • Dynamic obstacles that move around")
+    print("\n" + "=" * 65)
+    
+    sim = MultiRobotJobSimulation(boundary_size=(30, 30))
+    sim.run()

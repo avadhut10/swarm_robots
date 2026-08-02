@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>ArUco Markers for Printing</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; }
+        .header { 
+            background: #2c3e50; 
+            color: white; 
+            padding: 20px; 
+            border-radius: 10px;
+            margin-bottom: 30px;
+        }
+        .warning { 
+            background: #fff3cd; 
+            border: 1px solid #ffc107; 
+            padding: 15px; 
+            margin: 20px 0;
+            border-radius: 5px;
+        }
+        .warning strong { color: #856404; }
+        .marker-group { 
+            border: 2px solid #ddd; 
+            padding: 20px; 
+            margin: 20px 0;
+            border-radius: 10px;
+            background: white;
+            page-break-after: always;
+        }
+        .marker-group h2 { 
+            background: #ecf0f1; 
+            padding: 10px; 
+            margin: -20px -20px 20px -20px;
+            border-radius: 8px 8px 0 0;
+        }
+        .marker-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 30px;
+            justify-items: center;
+        }
+        .marker-item {
+            text-align: center;
+            padding: 10px;
+        }
+        .marker-item img {
+            max-width: 150px;
+            height: auto;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .marker-item .label {
+            margin-top: 10px;
+            font-weight: bold;
+            font-size: 14px;
+        }
+        .marker-item .size {
+            color: #666;
+            font-size: 12px;
+        }
+        .button {
+            background: #3498db;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        .button:hover { background: #2980b9; }
+        @media print {
+            .no-print { display: none; }
+            .marker-group { page-break-after: always; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>ArUco Markers for Swarm Robot System</h1>
+            <p>Dictionary: DICT_5X5_1000 | 300 DPI | Supports IDs 0-1023</p>
+        </div>
+        
+        <div class="warning no-print">
+            <strong>IMPORTANT:</strong> 
+            Print at 100% scale (no scaling/fit-to-page). 
+            Each marker has a 10mm scale bar for verification.
+            <br><br>
+            <button class="button" onclick="window.print()">🖨 Print This Page</button>
+        </div>
+
+        <div class="marker-group">
+            <h2>BOUNDARY MARKERS - 80mm</h2>
+            <div class="marker-grid">
+
+                <div class="marker-item">
+                    <img src="aruco_markers/boundary_ID0_80mm.png" alt="Marker ID 0">
+                    <div class="label">ID: 0</div>
+                    <div class="size">80mm x 80mm</div>
+                </div>
+
+                <div class="marker-item">
+                    <img src="aruco_markers/boundary_ID1_80mm.png" alt="Marker ID 1">
+                    <div class="label">ID: 1</div>
+                    <div class="size">80mm x 80mm</div>
+                </div>
+
+                <div class="marker-item">
+                    <img src="aruco_markers/boundary_ID2_80mm.png" alt="Marker ID 2">
+                    <div class="label">ID: 2</div>
+                    <div class="size">80mm x 80mm</div>
+                </div>
+
+                <div class="marker-item">
+                    <img src="aruco_markers/boundary_ID3_80mm.png" alt="Marker ID 3">
+                    <div class="label">ID: 3</div>
+                    <div class="size">80mm x 80mm</div>
+                </div>
+
+            </div>
+        </div>
+
+        <div class="marker-group">
+            <h2>START/STOP MARKERS - 60mm</h2>
+            <div class="marker-grid">
+
+                <div class="marker-item">
+                    <img src="aruco_markers/startstop_ID10_60mm.png" alt="Marker ID 10">
+                    <div class="label">ID: 10</div>
+                    <div class="size">60mm x 60mm</div>
+                </div>
+
+                <div class="marker-item">
+                    <img src="aruco_markers/startstop_ID11_60mm.png" alt="Marker ID 11">
+                    <div class="label">ID: 11</div>
+                    <div class="size">60mm x 60mm</div>
+                </div>
+
+            </div>
+        </div>
+
+        <div class="marker-group">
+            <h2>JOB LOCATIONS - 50mm</h2>
+            <div class="marker-grid">
+
+                <div class="marker-item">
+                    <img src="aruco_markers/job_ID20_50mm.png" alt="Marker ID 20">
+                    <div class="label">ID: 20</div>
+                    <div class="size">50mm x 50mm</div>
+                </div>
+
+                <div class="marker-item">
+                    <img src="aruco_markers/job_ID21_50mm.png" alt="Marker ID 21">
+                    <div class="label">ID: 21</div>
+                    <div class="size">50mm x 50mm</div>
+                </div>
+
+            </div>
+        </div>
+
+        <div class="marker-group">
+            <h2>ROBOT MARKERS - 40mm</h2>
+            <div class="marker-grid">
+
+                <div class="marker-item">
+                    <img src="aruco_markers/robot_ID100_40mm.png" alt="Marker ID 100">
+                    <div class="label">ID: 100</div>
+                    <div class="size">40mm x 40mm</div>
+                </div>
+
+                <div class="marker-item">
+                    <img src="aruco_markers/robot_ID101_40mm.png" alt="Marker ID 101">
+                    <div class="label">ID: 101</div>
+                    <div class="size">40mm x 40mm</div>
+                </div>
+
+                <div class="marker-item">
+                    <img src="aruco_markers/robot_ID102_40mm.png" alt="Marker ID 102">
+                    <div class="label">ID: 102</div>
+                    <div class="size">40mm x 40mm</div>
+                </div>
+
+            </div>
+        </div>
+
+    </div>
+</body>
+</html>

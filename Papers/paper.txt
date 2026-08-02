@@ -1,0 +1,5 @@
+Combinational circuits (adders, MUX)	              assign statements describe gate-level circuits
+Sequential circuits (counters, shift registers)	      always @(posedge clk) blocks describe flip-flops
+FSMs (Mealy, Moore)	                              A structured always block pattern implements any state machine
+FPGA synthesis	                                      Your Verilog code goes through Synthesis → Place & Route → Bitstream
+Testbenches	                                      A separate Verilog module that feeds test vectors to your design and checks outputs

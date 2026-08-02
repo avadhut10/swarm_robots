@@ -1,0 +1,28 @@
+
+    ========================================
+    PRINTING INSTRUCTIONS FOR ARUCO MARKERS
+    ========================================
+    
+    1. OPEN THE HTML FILE:
+       - Double-click on 'aruco_markers_printable.html'
+       - It will open in your web browser
+       
+    2. PRINT SETTINGS (VERY IMPORTANT!):
+       - Press Ctrl+P (or Cmd+P on Mac)
+       - Set 'Scale' to 100%
+       - Disable 'Fit to Page' or 'Shrink to Fit'
+       - Select 'A4' paper size
+       - Check 'Background Graphics' if available
+       
+    3. AFTER PRINTING:
+       - Measure each marker with a ruler
+       - Note the actual printed size (may vary slightly)
+       - Update your code with these measurements
+       
+    4. TIPS:
+       - Use matte paper (not glossy)
+       - Ensure black is truly black
+       - Laminate for durability (use matte laminate)
+    
+    ========================================
+    

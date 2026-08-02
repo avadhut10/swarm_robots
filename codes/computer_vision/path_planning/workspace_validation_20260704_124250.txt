@@ -1,0 +1,27 @@
+============================================================
+WORKSPACE VALIDATION REPORT
+============================================================
+
+Map file: F:\swarm_robots\codes\computer_vision\path_planning\workspace_map_20260703_131010.json
+Workspace: 2100x2850mm
+Markers found: 8
+Coordinate type: MM
+Boundary set: Yes
+
+ALL MARKER POSITIONS:
+----------------------------------------
+  B2 (ID 2): (1101.0, 60.0) mm
+  B3 (ID 3): (692.0, 75.0) mm
+  B0 (ID 0): (724.0, 619.0) mm
+  B1 (ID 1): (1139.0, 597.0) mm
+  START (ID 10): (914.0, 585.0) mm
+  END (ID 11): (823.0, 60.0) mm
+  JOB 1 (ID 20): (1068.0, 185.0) mm
+  ROBOT 2 (ID 101): (897.0, 259.0) mm
+
+VALIDATION RESULT:
+----------------------------------------
+Top (0 to 1): 415.6 mm
+Bottom (2 to 3): 409.3 mm
+Left (0 to 2): 674.2 mm
+Right (1 to 3): 687.2 mm

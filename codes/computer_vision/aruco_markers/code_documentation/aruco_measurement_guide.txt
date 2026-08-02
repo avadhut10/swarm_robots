@@ -1,0 +1,54 @@
+
+        ================================================================
+        ARUCO MARKER MEASUREMENT GUIDE
+        ================================================================
+        
+        GENERATION SETTINGS:
+        -------------------
+        Resolution: 300 DPI
+        Pixel density: 11.81 pixels/mm
+        Dictionary: DICT_5X5_1000 (IDs 0-1023)
+        
+        MARKER SIZES AND PIXEL DIMENSIONS:
+        ----------------------------------
+        Boundary Markers (IDs 0-3):  80mm x 80mm  -> 945 x 945 pixels
+        Start/Stop (IDs 10-11):      60mm x 60mm  -> 709 x 709 pixels
+        Job Locations (IDs 20-21):   50mm x 50mm  -> 591 x 591 pixels
+        Robot Markers (IDs 100-102): 40mm x 40mm  -> 472 x 472 pixels
+        
+        HOW TO MEASURE CORRECTLY:
+        -------------------------
+        1. OPEN 'aruco_markers_ALL_ON_ONE_SHEET.pdf' or 'aruco_markers_printable.html'
+        2. Set printer to 100% scale (NO scaling/fit-to-page)
+        3. Print on A4 paper
+        4. After printing, measure with a ruler:
+           - The 80mm marker should be exactly 80mm x 80mm
+           - The 60mm marker should be exactly 60mm x 60mm
+           - The 50mm marker should be exactly 50mm x 50mm
+           - The 40mm marker should be exactly 40mm x 40mm
+        5. Use the 10mm scale bar on each marker to verify
+        
+        IF SIZES ARE WRONG:
+        -------------------
+        If the printed size is not exact:
+        1. Check printer settings - ensure 100% scale
+        2. Disable "Fit to Page" or "Shrink to Fit"
+        3. Check "Actual Size" option in print dialog
+        4. If still wrong, measure the actual size and use THAT value in your code
+        
+        FOR DISTANCE CALCULATION:
+        -------------------------
+        Use these values in your detection code:
+        
+        MARKER_SIZES_MM = {
+            0: 80,  1: 80,  2: 80,  3: 80,      # Boundary
+            10: 60, 11: 60,                     # Start/Stop
+            20: 50, 21: 50,                     # Job
+            100: 40, 101: 40, 102: 40           # Robots
+        }
+        
+        IMPORTANT: If your printer scales differently, measure each marker
+        and update these values with your actual measured sizes!
+        
+        ================================================================
+        

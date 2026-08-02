@@ -1,0 +1,15 @@
+=== CAMERA CALIBRATION DATA ===
+Timestamp: 20260703_125942
+Camera: Motorola Smart Connect (ID: 1)
+Chessboard: 8x5
+Square size: 30mm
+Frames used: 25
+Reprojection error: 0.1402 pixels
+
+Camera Matrix:
+[[1.37405594e+03 0.00000000e+00 7.83158647e+02]
+ [0.00000000e+00 1.37902245e+03 3.20828464e+02]
+ [0.00000000e+00 0.00000000e+00 1.00000000e+00]]
+
+Distortion Coefficients:
+[ 0.25392183 -0.72320807 -0.00863342  0.04812322  1.23631673]

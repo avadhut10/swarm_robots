@@ -1,0 +1,1272 @@
+import cv2
+import numpy as np
+import json
+import time
+import math
+from datetime import datetime
+import os
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from matplotlib.patches import Rectangle, FancyBboxPatch, FancyArrowPatch, Circle, Polygon
+from matplotlib.widgets import Button, TextBox
+from scipy.spatial.distance import euclidean
+import itertools
+from collections import defaultdict
+import threading
+
+# ============================================================
+# KALMAN FILTER
+# ============================================================
+
+class KalmanFilter:
+    def __init__(self, dt=0.1):
+        self.dt = dt
+        self.state = np.zeros(4)
+        
+        self.F = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+        
+        self.H = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ])
+        
+        self.Q = np.eye(4) * 0.05
+        self.R = np.eye(2) * 0.3
+        self.P = np.eye(4) * 1.0
+        
+    def predict(self):
+        self.state = self.F @ self.state
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        return self.state[:2]
+    
+    def update(self, measurement):
+        y = measurement - self.H @ self.state
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        
+        self.state = self.state + K @ y
+        self.P = (np.eye(4) - K @ self.H) @ self.P
+        
+        return self.state[:2]
+    
+    def set_initial_state(self, position, velocity=None):
+        self.state[:2] = position
+        if velocity is not None:
+            self.state[2:] = velocity
+        else:
+            self.state[2:] = 0
+
+
+# ============================================================
+# COLLISION AVOIDANCE
+# ============================================================
+
+class CollisionAvoidance:
+    @staticmethod
+    def compute_avoidance_force(robot_pos, robot_vel, other_robots, obstacles,
+                                safety_radius=2.0, max_force=15.0):
+        avoidance_force = np.zeros(2)
+        
+        for other in other_robots:
+            diff = np.array(robot_pos) - np.array(other['pos'])
+            dist = np.linalg.norm(diff)
+            
+            if dist < 0.01:
+                diff = np.array([0.1, 0.1])
+                dist = 0.14
+            
+            rel_vel = np.array(robot_vel) - np.array(other.get('velocity', [0, 0]))
+            
+            if dist < safety_radius * 3:
+                rel_speed = np.linalg.norm(rel_vel)
+                if rel_speed > 0.01:
+                    t_closest = -np.dot(diff, rel_vel) / (rel_speed ** 2)
+                    t_closest = max(0, t_closest)
+                    closest_dist = np.linalg.norm(diff + rel_vel * t_closest)
+                    
+                    if closest_dist < safety_radius:
+                        if dist > 0:
+                            away_dir = diff / dist
+                        else:
+                            away_dir = np.array([1.0, 0.0])
+                        
+                        if dist < safety_radius:
+                            force_mag = max_force * 2
+                        elif closest_dist < safety_radius * 0.5:
+                            force_mag = max_force * (1 - closest_dist / safety_radius)
+                        else:
+                            force_mag = max_force * 0.3 * (1 - closest_dist / safety_radius)
+                        
+                        perp_dir = np.array([-diff[1], diff[0]])
+                        if dist > 0:
+                            perp_dir = perp_dir / dist
+                        
+                        avoidance_force += away_dir * force_mag * 0.7
+                        
+                        perp_component = np.dot(rel_vel, perp_dir)
+                        if abs(perp_component) < 0.5:
+                            perp_force = perp_dir * force_mag * 0.3
+                            avoidance_force += perp_force
+                
+                if dist < safety_radius:
+                    repulsion = (diff / dist) * max_force * (safety_radius - dist) / safety_radius
+                    avoidance_force += repulsion * 3
+        
+        for obs in obstacles:
+            if obs.get('moving', False):
+                obs_pos = obs['pos']
+                obs_vel = obs.get('velocity', [0, 0])
+            else:
+                obs_pos = obs['center'] if 'center' in obs else obs['pos']
+                obs_vel = [0, 0]
+            
+            diff = np.array(robot_pos) - np.array(obs_pos)
+            dist = np.linalg.norm(diff)
+            obs_radius = obs.get('radius', obs.get('size', 1.0))
+            safe_dist = obs_radius + safety_radius
+            
+            if dist < safe_dist * 2:
+                if dist < 0.01:
+                    diff = np.array([0.1, 0.1])
+                    dist = 0.14
+                
+                rel_vel = np.array(robot_vel) - np.array(obs_vel)
+                
+                if np.linalg.norm(rel_vel) > 0.01:
+                    t_closest = -np.dot(diff, rel_vel) / (np.linalg.norm(rel_vel) ** 2)
+                    t_closest = max(0, t_closest)
+                    closest_dist = np.linalg.norm(diff + rel_vel * t_closest)
+                    
+                    if closest_dist < safe_dist:
+                        away_dir = diff / dist
+                        
+                        if dist < safe_dist:
+                            force_mag = max_force * 2.5
+                        else:
+                            force_mag = max_force * (1 - closest_dist / safe_dist) * 1.5
+                        
+                        avoidance_force += away_dir * force_mag
+                        
+                        tangent = np.array([-away_dir[1], away_dir[0]])
+                        tangent_component = np.dot(rel_vel, tangent)
+                        avoidance_force += tangent * tangent_component * 0.3
+        
+        force_mag = np.linalg.norm(avoidance_force)
+        if force_mag > max_force * 3:
+            avoidance_force = avoidance_force / force_mag * max_force * 3
+        
+        return avoidance_force
+    
+    @staticmethod
+    def check_obstacle_collision(pos, obstacles):
+        for obs in obstacles:
+            if obs.get('moving', False):
+                obs_pos = obs['pos']
+                obs_radius = obs.get('radius', 1.0)
+            else:
+                obs_pos = obs['center'] if 'center' in obs else obs['pos']
+                obs_radius = obs.get('radius', obs.get('size', 1.0))
+            
+            dist = euclidean(pos, obs_pos)
+            if dist < obs_radius + 0.5:
+                return True
+        return False
+
+
+# ============================================================
+# REAL-TIME ARUCO DETECTOR - FIXED
+# ============================================================
+
+class RealTimeArUcoDetector:
+    def __init__(self, camera_id=1, calibration_file=None, map_file=None):
+        self.camera_id = camera_id
+        self.cap = None
+        self.is_camera_open = False
+        
+        self.camera_matrix = None
+        self.distortion_coeffs = None
+        self.is_calibrated = False
+        
+        if calibration_file and os.path.exists(calibration_file):
+            self.load_calibration(calibration_file)
+        
+        try:
+            self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_1000)
+        except:
+            self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5)
+        
+        self.parameters = cv2.aruco.DetectorParameters()
+        
+        self.workspace_width_mm = 2100
+        self.workspace_height_mm = 2850
+        
+        # Store positions as regular Python objects (not numpy arrays)
+        self.robot_positions = {}
+        self.task_positions = {}
+        self.start_location = None
+        self.end_location = None
+        self.boundary_points = {}
+        self.all_detected_markers = {}
+        
+        self.latest_robot_positions = {}
+        self.latest_task_positions = {}
+        self.latest_start = None
+        self.latest_end = None
+        
+        self.perspective_matrix = None
+        self.inverse_perspective = None
+        self.is_boundary_set = False
+        self.latest_frame = None
+        
+        self.running = False
+        self.detection_thread = None
+        
+        print("📷 Real-Time ArUco Detector (DYNAMIC) Initialized")
+        print(f"   Workspace: {self.workspace_width_mm}x{self.workspace_height_mm}mm")
+    
+    def load_calibration(self, filename):
+        try:
+            data = np.load(filename)
+            self.camera_matrix = data['camera_matrix']
+            self.distortion_coeffs = data['distortion_coeffs']
+            self.is_calibrated = True
+            print(f"✅ Calibration loaded: {filename}")
+            return True
+        except Exception as e:
+            print(f"❌ Could not load calibration: {e}")
+            return False
+    
+    def open_camera(self):
+        self.cap = cv2.VideoCapture(self.camera_id)
+        if not self.cap.isOpened():
+            print(f"❌ Could not open camera {self.camera_id}")
+            return False
+        
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        
+        self.is_camera_open = True
+        print(f"✅ Camera opened")
+        return True
+    
+    def close_camera(self):
+        if self.cap is not None:
+            self.cap.release()
+            self.is_camera_open = False
+            self.running = False
+    
+    def undistort_frame(self, frame):
+        if not self.is_calibrated or self.camera_matrix is None:
+            return frame
+        
+        h, w = frame.shape[:2]
+        new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(
+            self.camera_matrix, self.distortion_coeffs, (w, h), 1, (w, h)
+        )
+        
+        undistorted = cv2.undistort(
+            frame, self.camera_matrix, self.distortion_coeffs, None, new_camera_matrix
+        )
+        
+        x, y, w, h = roi
+        if x > 0 and y > 0 and w > 0 and h > 0:
+            undistorted = undistorted[y:y+h, x:x+w]
+        
+        return undistorted
+    
+    def detect_markers(self, frame):
+        """Detect ALL ArUco markers in real-time"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        try:
+            corners, ids, rejected = cv2.aruco.detectMarkers(
+                gray, self.aruco_dict, parameters=self.parameters
+            )
+        except:
+            corners, ids, rejected = cv2.aruco.detectMarkers(
+                gray, self.aruco_dict
+            )
+        
+        self.all_detected_markers = {}
+        corner_markers = {}
+        robot_markers = {}
+        task_markers = {}
+        start_pos = None
+        end_pos = None
+        
+        if ids is not None and len(ids) > 0:
+            for i in range(len(ids)):
+                marker_id = int(ids[i][0])
+                marker_corners = corners[i][0]
+                
+                center_x = int(np.mean(marker_corners[:, 0]))
+                center_y = int(np.mean(marker_corners[:, 1]))
+                
+                self.all_detected_markers[marker_id] = {
+                    'center': (center_x, center_y),
+                    'corners': marker_corners
+                }
+                
+                if marker_id in [0, 1, 2, 3]:
+                    corner_markers[marker_id] = (center_x, center_y)
+                elif marker_id in [100, 101, 102]:
+                    robot_markers[marker_id] = (center_x, center_y)
+                elif marker_id in [20, 21]:
+                    task_markers[marker_id] = (center_x, center_y)
+                elif marker_id == 10:
+                    start_pos = (center_x, center_y)
+                elif marker_id == 11:
+                    end_pos = (center_x, center_y)
+        
+        # Setup boundary if we have all corners
+        if len(corner_markers) == 4 and not self.is_boundary_set:
+            ordered_points = []
+            for id in [0, 1, 2, 3]:
+                if id in corner_markers:
+                    ordered_points.append(corner_markers[id])
+            
+            if len(ordered_points) == 4:
+                src_points = np.array(ordered_points, dtype=np.float32)
+                dst_points = np.array([
+                    [0, 0],
+                    [self.workspace_width_mm, 0],
+                    [0, self.workspace_height_mm],
+                    [self.workspace_width_mm, self.workspace_height_mm]
+                ], dtype=np.float32)
+                
+                self.perspective_matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+                self.inverse_perspective = cv2.getPerspectiveTransform(dst_points, src_points)
+                self.is_boundary_set = True
+                print("✅ Boundary set from real-time detection!")
+        
+        # Convert ALL positions to world coordinates - store as tuple not numpy array
+        self.robot_positions = {}
+        for marker_id, pixel_pos in robot_markers.items():
+            if self.perspective_matrix is not None:
+                pixel_point = np.array([[[pixel_pos[0], pixel_pos[1]]]], dtype=np.float32)
+                world_point = cv2.perspectiveTransform(pixel_point, self.perspective_matrix)
+                world_x, world_y = world_point[0][0]
+                self.robot_positions[marker_id] = (float(world_x), float(world_y))
+            else:
+                self.robot_positions[marker_id] = pixel_pos
+        
+        self.task_positions = {}
+        for marker_id, pixel_pos in task_markers.items():
+            if self.perspective_matrix is not None:
+                pixel_point = np.array([[[pixel_pos[0], pixel_pos[1]]]], dtype=np.float32)
+                world_point = cv2.perspectiveTransform(pixel_point, self.perspective_matrix)
+                world_x, world_y = world_point[0][0]
+                self.task_positions[marker_id] = (float(world_x), float(world_y))
+            else:
+                self.task_positions[marker_id] = pixel_pos
+        
+        if start_pos and self.perspective_matrix is not None:
+            pixel_point = np.array([[[start_pos[0], start_pos[1]]]], dtype=np.float32)
+            world_point = cv2.perspectiveTransform(pixel_point, self.perspective_matrix)
+            world_x, world_y = world_point[0][0]
+            self.start_location = (float(world_x), float(world_y))
+        else:
+            self.start_location = start_pos
+        
+        if end_pos and self.perspective_matrix is not None:
+            pixel_point = np.array([[[end_pos[0], end_pos[1]]]], dtype=np.float32)
+            world_point = cv2.perspectiveTransform(pixel_point, self.perspective_matrix)
+            world_x, world_y = world_point[0][0]
+            self.end_location = (float(world_x), float(world_y))
+        else:
+            self.end_location = end_pos
+        
+        # Store latest as Python tuples
+        self.latest_robot_positions = self.robot_positions.copy()
+        self.latest_task_positions = self.task_positions.copy()
+        self.latest_start = self.start_location
+        self.latest_end = self.end_location
+        
+        return self.robot_positions, self.task_positions, self.start_location, self.end_location
+    
+    def get_all_positions(self):
+        return {
+            'robots': self.latest_robot_positions,
+            'tasks': self.latest_task_positions,
+            'start': self.latest_start,
+            'end': self.latest_end,
+            'boundary': self.boundary_points,
+            'all_markers': self.all_detected_markers
+        }
+    
+    def get_robot_positions(self):
+        return self.latest_robot_positions
+    
+    def get_task_positions(self):
+        return self.latest_task_positions
+    
+    def get_start_location(self):
+        return self.latest_start
+    
+    def get_end_location(self):
+        return self.latest_end
+    
+    def is_start_detected(self):
+        return self.latest_start is not None
+    
+    def is_end_detected(self):
+        return self.latest_end is not None
+    
+    def start_detection(self):
+        if not self.is_camera_open:
+            if not self.open_camera():
+                return False
+        
+        self.running = True
+        self.detection_thread = threading.Thread(target=self._detection_loop)
+        self.detection_thread.daemon = True
+        self.detection_thread.start()
+        return True
+    
+    def _detection_loop(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+            
+            if self.is_calibrated:
+                frame = self.undistort_frame(frame)
+            
+            self.latest_frame = frame
+            self.detect_markers(frame)
+            
+            time.sleep(0.033)
+    
+    def stop_detection(self):
+        self.running = False
+        if self.detection_thread:
+            self.detection_thread.join(timeout=1.0)
+    
+    def show_camera_feed(self):
+        """Show camera feed with overlays"""
+        while self.running:
+            if self.latest_frame is not None:
+                frame = self.latest_frame.copy()
+                
+                # Draw all detected markers
+                for marker_id, data in self.all_detected_markers.items():
+                    center = data['center']
+                    
+                    if marker_id in [0, 1, 2, 3]:
+                        color = (0, 255, 0)  # Green
+                    elif marker_id in [100, 101, 102]:
+                        color = (0, 0, 255)  # Red
+                    elif marker_id in [20, 21]:
+                        color = (255, 165, 0)  # Orange
+                    elif marker_id == 10:
+                        color = (0, 255, 255)  # Yellow
+                    elif marker_id == 11:
+                        color = (255, 0, 0)  # Red
+                    else:
+                        color = (255, 255, 0)  # Yellow
+                    
+                    cv2.circle(frame, center, 5, color, -1)
+                    cv2.putText(frame, str(marker_id), (center[0]-10, center[1]-10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                
+                # Show robot positions
+                y_offset = 30
+                for marker_id, pos in self.latest_robot_positions.items():
+                    cv2.putText(frame, f"R{marker_id-99}: ({pos[0]:.0f},{pos[1]:.0f})mm",
+                               (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                    y_offset += 25
+                
+                # Show START - FIXED: Check if it's not None
+                if self.latest_start is not None:
+                    try:
+                        # Handle both tuple and array
+                        if isinstance(self.latest_start, (tuple, list)):
+                            start_x, start_y = self.latest_start[0], self.latest_start[1]
+                        else:
+                            start_x, start_y = self.latest_start[0], self.latest_start[1]
+                        cv2.putText(frame, f"START: ({start_x:.0f},{start_y:.0f})mm",
+                                   (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                        y_offset += 25
+                    except:
+                        pass
+                
+                # Show END - FIXED: Check if it's not None
+                if self.latest_end is not None:
+                    try:
+                        if isinstance(self.latest_end, (tuple, list)):
+                            end_x, end_y = self.latest_end[0], self.latest_end[1]
+                        else:
+                            end_x, end_y = self.latest_end[0], self.latest_end[1]
+                        cv2.putText(frame, f"END: ({end_x:.0f},{end_y:.0f})mm",
+                                   (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                    except:
+                        pass
+                
+                # Show boundary status
+                status = "SET" if self.is_boundary_set else "WAITING"
+                cv2.putText(frame, f"Boundary: {status}", (10, frame.shape[0]-30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, 
+                           (0, 255, 0) if self.is_boundary_set else (0, 0, 255), 2)
+                
+                cv2.putText(frame, "Press 'q' to close", (10, frame.shape[0]-10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                
+                cv2.imshow('ArUco Detection', frame)
+                
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+            else:
+                time.sleep(0.01)
+        
+        cv2.destroyAllWindows()
+
+
+# ============================================================
+# REAL-TIME MULTI-ROBOT SIMULATION - DYNAMIC
+# ============================================================
+
+class RealtimeMultiRobotSimulation:
+    def __init__(self, map_file=None, calibration_file=None):
+        self.detector = RealTimeArUcoDetector(
+            camera_id=1,
+            calibration_file=calibration_file,
+            map_file=map_file
+        )
+        
+        self.workspace_width = self.detector.workspace_width_mm
+        self.workspace_height = self.detector.workspace_height_mm
+        
+        self.scale = 0.01
+        self.sim_width = self.workspace_width * self.scale
+        self.sim_height = self.workspace_height * self.scale
+        
+        self.robots = []
+        self.jobs = []
+        self.start_marker = None
+        self.end_marker = None
+        self.next_job_id = 1
+        self.robot_colors = ['#3498DB', '#E74C3C', '#2ECC71', '#F39C12', '#9B59B6', '#1ABC9C']
+        
+        self.known_robot_ids = set()
+        self.known_job_ids = set()
+        self.start_id = 10
+        self.end_id = 11
+        
+        self.obstacles = []
+        
+        self.selected_robot = 0
+        self.mode = 'view'
+        self.animating = False
+        self.simulation_time = 0
+        self.collision_avoidance_enabled = True
+        self.show_safety_zones = True
+        self.realtime_update = True
+        
+        self.setup_visualization()
+        self.detector.start_detection()
+        
+        print("\n" + "="*60)
+        print("🤖 DYNAMIC REAL-TIME MULTI-ROBOT SIMULATION")
+        print("="*60)
+        print("   • Detects robots (IDs 100-102) in real-time")
+        print("   • Detects jobs (IDs 20-21) in real-time")
+        print("   • Detects START (ID 10) in real-time")
+        print("   • Detects END (ID 11) in real-time")
+        print("="*60)
+    
+    def setup_visualization(self):
+        self.fig = plt.figure(figsize=(18, 10))
+        
+        self.ax = self.fig.add_axes([0.04, 0.08, 0.68, 0.88])
+        self.ax.set_xlim(-2, self.sim_width + 2)
+        self.ax.set_ylim(-2, self.sim_height + 2)
+        self.ax.set_aspect('equal')
+        self.ax.grid(True, alpha=0.2, linestyle='--')
+        self.ax.set_title('DYNAMIC REAL-TIME SIMULATION', 
+                         fontsize=14, fontweight='bold', pad=15)
+        
+        boundary = Rectangle((0, 0), self.sim_width, self.sim_height,
+                            fill=True, facecolor='#F5F5F5', edgecolor='#2C3E50', 
+                            linewidth=3, alpha=0.5)
+        self.ax.add_patch(boundary)
+        
+        grid_step = 0.5
+        x = 0
+        while x <= self.sim_width:
+            self.ax.axvline(x=x, color='#DDD', alpha=0.3, linewidth=0.5)
+            x += grid_step
+        
+        y = 0
+        while y <= self.sim_height:
+            self.ax.axhline(y=y, color='#DDD', alpha=0.3, linewidth=0.5)
+            y += grid_step
+        
+        self.instruction = self.ax.text(
+            self.sim_width/2, -1.5,
+            'Mode: View | Dynamic: Add/remove markers in real-time!',
+            ha='center', fontsize=10, fontweight='bold', color='#2ECC71',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='white', 
+                     edgecolor='#2ECC71', alpha=0.9)
+        )
+        
+        self.fig.canvas.mpl_connect('button_press_event', self.on_click)
+        self.create_ui()
+        self.draw_all()
+        self.update_status()
+    
+    def create_ui(self):
+        x = 0.76
+        w = 0.20
+        h = 0.035
+        y_start = 0.92
+        
+        self.fig.text(x + w/2, y_start + 0.02, '🤖 ROBOTS (DYNAMIC)', 
+                     ha='center', fontsize=10, fontweight='bold')
+        
+        self.robot_buttons = []
+        self.robot_ax_list = []
+        
+        y = y_start - 0.16
+        self.fig.text(x + w/2, y + 0.02, '📍 MODE', 
+                     ha='center', fontsize=10, fontweight='bold')
+        
+        modes = [
+            ('👁️ View', 'view', '#3498DB'),
+            ('📦 Add Job', 'add_job', '#F39C12'),
+        ]
+        
+        self.mode_buttons = {}
+        for label, mode, color in modes:
+            y -= 0.035
+            ax_btn = self.fig.add_axes([x, y, w, h])
+            btn = Button(ax_btn, label, color=color, hovercolor=color)
+            btn.label.set_fontsize(7)
+            btn.on_clicked(lambda event, m=mode: self.set_mode(m))
+            self.mode_buttons[mode] = btn
+        
+        y -= 0.04
+        self.fig.text(x + w/2, y + 0.02, '⚡ ACTIONS', 
+                     ha='center', fontsize=10, fontweight='bold')
+        
+        actions = [
+            ('🔄 Calculate Paths', '#3498DB', 'calc'),
+            ('▶️ Start Animation', '#2ECC71', 'anim'),
+            ('🔄 Reset All', '#95A5A6', 'reset'),
+            ('🗑️ Clear Jobs', '#E67E22', 'clear')
+        ]
+        
+        self.action_buttons = {}
+        for label, color, key in actions:
+            y -= 0.035
+            ax_btn = self.fig.add_axes([x, y, w, h])
+            btn = Button(ax_btn, label, color=color, hovercolor=color)
+            btn.label.set_fontsize(7)
+            self.action_buttons[key] = btn
+        
+        self.action_buttons['calc'].on_clicked(self.calculate_all_paths)
+        self.action_buttons['anim'].on_clicked(self.toggle_animation)
+        self.action_buttons['reset'].on_clicked(self.reset_all)
+        self.action_buttons['clear'].on_clicked(self.clear_jobs)
+        
+        self.status_text = self.fig.text(x, 0.02, '', fontsize=6.5, 
+                                         fontfamily='monospace', va='bottom')
+    
+    def update_dynamic_markers(self):
+        positions = self.detector.get_all_positions()
+        
+        # Update robots
+        new_robot_ids = set(positions['robots'].keys())
+        current_robot_ids = {r['marker_id'] for r in self.robots}
+        
+        for marker_id in new_robot_ids - current_robot_ids:
+            pos = positions['robots'][marker_id]
+            sim_x = pos[0] * self.scale
+            sim_y = pos[1] * self.scale
+            robot_num = marker_id - 99
+            
+            new_robot = {
+                'id': f'R{robot_num}',
+                'marker_id': marker_id,
+                'start': (sim_x, sim_y),
+                'end': (sim_x + 1, sim_y + 1),
+                'pos': [sim_x, sim_y],
+                'target_pos': [sim_x, sim_y],
+                'color': self.robot_colors[len(self.robots) % len(self.robot_colors)],
+                'path': [],
+                'waypoints': [],
+                'current_waypoint': 0,
+                'total_distance': 0,
+                'assigned_jobs': [],
+                'kf': KalmanFilter(dt=0.05),
+                'moving': False,
+                'velocity': [0, 0],
+                'speed': 8.0,
+                'avoidance_force': [0, 0],
+                'safety_radius': 1.5,
+                'real_pos_mm': pos
+            }
+            new_robot['kf'].set_initial_state([sim_x, sim_y])
+            self.robots.append(new_robot)
+            print(f"✅ New robot detected: ID {marker_id} -> R{robot_num}")
+        
+        for robot in self.robots[:]:
+            if robot['marker_id'] not in new_robot_ids:
+                print(f"❌ Robot {robot['id']} (ID {robot['marker_id']}) removed")
+                self.robots.remove(robot)
+        
+        for robot in self.robots:
+            if robot['marker_id'] in positions['robots']:
+                pos = positions['robots'][robot['marker_id']]
+                sim_x = pos[0] * self.scale
+                sim_y = pos[1] * self.scale
+                robot['real_pos_mm'] = pos
+                robot['pos'] = [sim_x, sim_y]
+                robot['start'] = (sim_x, sim_y)
+                robot['kf'].set_initial_state([sim_x, sim_y])
+        
+        # Update jobs
+        new_job_ids = set(positions['tasks'].keys())
+        current_job_ids = {j['marker_id'] for j in self.jobs}
+        
+        for marker_id in new_job_ids - current_job_ids:
+            pos = positions['tasks'][marker_id]
+            sim_x = pos[0] * self.scale
+            sim_y = pos[1] * self.scale
+            
+            colors = ['#E74C3C', '#3498DB', '#2ECC71', '#F39C12', '#9B59B6']
+            
+            new_job = {
+                'id': f'J{self.next_job_id}',
+                'marker_id': marker_id,
+                'pos': (sim_x, sim_y),
+                'pos_mm': pos,
+                'color': colors[(self.next_job_id - 1) % len(colors)],
+                'picked': False,
+                'assigned_to': None
+            }
+            self.jobs.append(new_job)
+            self.next_job_id += 1
+            print(f"✅ New job detected: ID {marker_id} -> J{self.next_job_id-1}")
+        
+        for job in self.jobs[:]:
+            if job['marker_id'] not in new_job_ids:
+                print(f"❌ Job {job['id']} (ID {job['marker_id']}) removed")
+                self.jobs.remove(job)
+        
+        for job in self.jobs:
+            if job['marker_id'] in positions['tasks']:
+                pos = positions['tasks'][job['marker_id']]
+                sim_x = pos[0] * self.scale
+                sim_y = pos[1] * self.scale
+                job['pos'] = (sim_x, sim_y)
+                job['pos_mm'] = pos
+        
+        # Update START
+        if positions['start'] is not None:
+            pos = positions['start']
+            sim_x = pos[0] * self.scale
+            sim_y = pos[1] * self.scale
+            self.start_marker = (sim_x, sim_y, pos)
+            if not hasattr(self, '_start_detected'):
+                print(f"✅ START marker detected at ({pos[0]:.0f}, {pos[1]:.0f})mm")
+                self._start_detected = True
+        else:
+            self.start_marker = None
+            if hasattr(self, '_start_detected'):
+                print("❌ START marker removed")
+                self._start_detected = False
+        
+        # Update END
+        if positions['end'] is not None:
+            pos = positions['end']
+            sim_x = pos[0] * self.scale
+            sim_y = pos[1] * self.scale
+            self.end_marker = (sim_x, sim_y, pos)
+            if not hasattr(self, '_end_detected'):
+                print(f"✅ END marker detected at ({pos[0]:.0f}, {pos[1]:.0f})mm")
+                self._end_detected = True
+        else:
+            self.end_marker = None
+            if hasattr(self, '_end_detected'):
+                print("❌ END marker removed")
+                self._end_detected = False
+    
+    def set_mode(self, mode):
+        self.mode = mode
+        self.update_instruction()
+    
+    def update_instruction(self):
+        mode_texts = {
+            'view': 'Mode: View | Dynamic: Add/remove markers in real-time!',
+            'add_job': 'Mode: Add Job | Click on map to add a job'
+        }
+        self.instruction.set_text(mode_texts[self.mode])
+        self.fig.canvas.draw_idle()
+    
+    def on_click(self, event):
+        if event.inaxes != self.ax:
+            return
+        
+        x, y = event.xdata, event.ydata
+        if not (0 <= x <= self.sim_width and 0 <= y <= self.sim_height):
+            return
+        
+        x_mm = x / self.scale
+        y_mm = y / self.scale
+        
+        if self.mode == 'add_job':
+            colors = ['#E74C3C', '#3498DB', '#2ECC71', '#F39C12', '#9B59B6']
+            job = {
+                'id': f'J{self.next_job_id}',
+                'marker_id': None,
+                'pos': (x, y),
+                'pos_mm': (x_mm, y_mm),
+                'color': colors[(self.next_job_id - 1) % len(colors)],
+                'picked': False,
+                'assigned_to': None
+            }
+            self.jobs.append(job)
+            self.next_job_id += 1
+            print(f"✅ Added simulated job at ({x_mm:.0f}, {y_mm:.0f})mm")
+            self.draw_all()
+            self.update_status()
+    
+    def assign_jobs_to_robots(self):
+        for job in self.jobs:
+            job['assigned_to'] = None
+        
+        if not self.jobs or not self.robots:
+            return
+        
+        distances = []
+        for j_idx, job in enumerate(self.jobs):
+            for r_idx, robot in enumerate(self.robots):
+                dist = euclidean(job['pos'], robot['start'])
+                distances.append((dist, j_idx, r_idx))
+        
+        distances.sort()
+        
+        assigned_jobs = set()
+        robot_counts = defaultdict(int)
+        max_per_robot = max(1, len(self.jobs) // len(self.robots) + 1)
+        
+        for dist, j_idx, r_idx in distances:
+            if j_idx not in assigned_jobs and robot_counts[r_idx] < max_per_robot:
+                self.jobs[j_idx]['assigned_to'] = r_idx
+                assigned_jobs.add(j_idx)
+                robot_counts[r_idx] += 1
+        
+        for j_idx in range(len(self.jobs)):
+            if j_idx not in assigned_jobs:
+                min_robot = min(range(len(self.robots)), 
+                              key=lambda r: robot_counts[r])
+                self.jobs[j_idx]['assigned_to'] = min_robot
+                robot_counts[min_robot] += 1
+    
+    def calculate_shortest_path(self, robot_idx):
+        robot = self.robots[robot_idx]
+        assigned = [j for j in self.jobs if j['assigned_to'] == robot_idx]
+        
+        if not assigned:
+            path = [robot['start'], robot.get('end', robot['start'])]
+            robot['path'] = path
+            robot['waypoints'] = path
+            robot['total_distance'] = euclidean(robot['start'], robot.get('end', robot['start']))
+            robot['assigned_jobs'] = []
+            return
+        
+        positions = [j['pos'] for j in assigned]
+        
+        unvisited = list(range(len(positions)))
+        curr = robot['start']
+        best_order = []
+        
+        while unvisited:
+            nearest = min(unvisited, key=lambda i: euclidean(curr, positions[i]))
+            best_order.append(nearest)
+            curr = positions[nearest]
+            unvisited.remove(nearest)
+        
+        path = [robot['start']]
+        robot['assigned_jobs'] = []
+        for idx in best_order:
+            path.append(positions[idx])
+            robot['assigned_jobs'].append(assigned[idx])
+        path.append(robot.get('end', robot['start']))
+        
+        robot['path'] = path
+        robot['waypoints'] = path
+        
+        total_dist = 0
+        for i in range(len(path)-1):
+            total_dist += euclidean(path[i], path[i+1])
+        robot['total_distance'] = total_dist
+    
+    def calculate_all_paths(self, event):
+        self.assign_jobs_to_robots()
+        for i in range(len(self.robots)):
+            self.calculate_shortest_path(i)
+        self.draw_all()
+        self.update_status()
+    
+    def clear_jobs(self, event):
+        self.jobs.clear()
+        self.next_job_id = 1
+        for robot in self.robots:
+            robot['path'] = []
+            robot['waypoints'] = []
+            robot['total_distance'] = 0
+            robot['assigned_jobs'] = []
+            robot['moving'] = False
+        self.draw_all()
+        self.update_status()
+    
+    def toggle_animation(self, event):
+        if self.animating:
+            self.animating = False
+            self.action_buttons['anim'].label.set_text('▶️ Start Animation')
+        else:
+            if not any(r['path'] for r in self.robots):
+                self.calculate_all_paths(None)
+            
+            for robot in self.robots:
+                robot['current_waypoint'] = 0
+                robot['pos'] = list(robot['start'])
+                robot['target_pos'] = list(robot['start'])
+                robot['kf'].set_initial_state(robot['start'])
+                robot['moving'] = False
+                robot['velocity'] = [0, 0]
+                robot['avoidance_force'] = [0, 0]
+            
+            for job in self.jobs:
+                job['picked'] = False
+            
+            self.simulation_time = 0
+            self.animating = True
+            self.action_buttons['anim'].label.set_text('⏸️ Pause Animation')
+    
+    def reset_all(self, event):
+        self.animating = False
+        self.action_buttons['anim'].label.set_text('▶️ Start Animation')
+        
+        for robot in self.robots:
+            robot['pos'] = list(robot['start'])
+            robot['target_pos'] = list(robot['start'])
+            robot['path'] = []
+            robot['waypoints'] = []
+            robot['current_waypoint'] = 0
+            robot['total_distance'] = 0
+            robot['assigned_jobs'] = []
+            robot['kf'].set_initial_state(robot['start'])
+            robot['moving'] = False
+            robot['velocity'] = [0, 0]
+            robot['avoidance_force'] = [0, 0]
+        
+        for job in self.jobs:
+            job['picked'] = False
+            job['assigned_to'] = None
+        
+        self.draw_all()
+        self.update_status()
+    
+    def update_animation(self, frame):
+        if not self.animating:
+            return []
+        
+        self.update_dynamic_markers()
+        
+        dt = 0.05
+        self.simulation_time += dt
+        
+        all_done = True
+        
+        for robot in self.robots:
+            robot['avoidance_force'] = [0, 0]
+        
+        if self.collision_avoidance_enabled:
+            for i, robot in enumerate(self.robots):
+                if robot['moving']:
+                    other_robots = [self.robots[j] for j in range(len(self.robots)) if j != i]
+                    avoidance = CollisionAvoidance.compute_avoidance_force(
+                        robot['pos'], robot['velocity'], other_robots, self.obstacles,
+                        safety_radius=robot['safety_radius']
+                    )
+                    robot['avoidance_force'] = avoidance.tolist()
+        
+        for robot in self.robots:
+            if not robot['waypoints'] or robot['current_waypoint'] >= len(robot['waypoints']) - 1:
+                robot['moving'] = False
+                robot['velocity'] = [0, 0]
+                continue
+            
+            all_done = False
+            robot['moving'] = True
+            
+            target = np.array(robot['waypoints'][robot['current_waypoint'] + 1])
+            current = np.array(robot['pos'])
+            
+            direction = target - current
+            distance = np.linalg.norm(direction)
+            
+            if distance < 0.5:
+                robot['current_waypoint'] += 1
+                
+                r_idx = self.robots.index(robot)
+                for job in self.jobs:
+                    if (not job['picked'] and job['assigned_to'] == r_idx and 
+                        euclidean(robot['pos'], job['pos']) < 1.0):
+                        job['picked'] = True
+                
+                if robot['current_waypoint'] >= len(robot['waypoints']) - 1:
+                    robot['moving'] = False
+                    robot['velocity'] = [0, 0]
+            else:
+                direction_norm = direction / distance
+                desired_velocity = direction_norm * robot['speed']
+                
+                if self.collision_avoidance_enabled:
+                    avoidance = np.array(robot['avoidance_force'])
+                    combined_velocity = desired_velocity + avoidance
+                    
+                    speed = np.linalg.norm(combined_velocity)
+                    if speed > robot['speed'] * 1.5:
+                        combined_velocity = combined_velocity / speed * robot['speed'] * 1.5
+                    if speed < robot['speed'] * 0.3 and distance > 1.0:
+                        combined_velocity = direction_norm * robot['speed'] * 0.5
+                else:
+                    combined_velocity = desired_velocity
+                
+                robot['kf'].state[2:] = combined_velocity
+                robot['kf'].predict()
+                
+                noise = np.random.normal(0, 0.05, 2)
+                measurement = current + combined_velocity * dt + noise
+                
+                estimated_pos = robot['kf'].update(measurement)
+                
+                estimated_pos[0] = np.clip(estimated_pos[0], 0.5, self.sim_width - 0.5)
+                estimated_pos[1] = np.clip(estimated_pos[1], 0.5, self.sim_height - 0.5)
+                
+                robot['pos'] = estimated_pos.tolist()
+                robot['velocity'] = combined_velocity.tolist()
+        
+        if all_done:
+            self.animating = False
+            self.action_buttons['anim'].label.set_text('▶️ Start Animation')
+            for robot in self.robots:
+                robot['moving'] = False
+                robot['velocity'] = [0, 0]
+        
+        self.draw_all()
+        self.update_status()
+        return []
+    
+    def draw_all(self):
+        for artist in self.ax.collections[:]:
+            artist.remove()
+        for text in self.ax.texts[:]:
+            if text != self.instruction:
+                text.remove()
+        
+        old_patches = [p for p in self.ax.patches 
+                      if not (isinstance(p, Rectangle) and 
+                             p.get_facecolor()[:3] == (0.96, 0.96, 0.96))]
+        for patch in old_patches:
+            patch.remove()
+        
+        for obs in self.obstacles:
+            if obs.get('moving', False):
+                pos = obs['pos']
+            else:
+                pos = obs['center']
+            
+            circle = Circle(pos, obs.get('radius', 1.0),
+                          fill=True, facecolor=obs['color'],
+                          edgecolor='#5D3A1A', linewidth=2,
+                          alpha=obs.get('alpha', 0.7), zorder=2)
+            self.ax.add_patch(circle)
+        
+        # Draw START
+        if self.start_marker is not None:
+            x, y, pos_mm = self.start_marker
+            self.ax.plot(x, y, '*', markersize=20, color='lime', 
+                        markeredgecolor='darkgreen', markeredgewidth=2, zorder=4)
+            self.ax.text(x, y-0.5, '🏁 START', ha='center', fontsize=8, 
+                        fontweight='bold', color='darkgreen')
+            self.ax.text(x, y+0.5, f'({pos_mm[0]:.0f},{pos_mm[1]:.0f})mm', 
+                        ha='center', fontsize=6, color='gray')
+        
+        # Draw END
+        if self.end_marker is not None:
+            x, y, pos_mm = self.end_marker
+            self.ax.plot(x, y, '*', markersize=20, color='red', 
+                        markeredgecolor='darkred', markeredgewidth=2, zorder=4)
+            self.ax.text(x, y-0.5, '🏁 END', ha='center', fontsize=8, 
+                        fontweight='bold', color='darkred')
+            self.ax.text(x, y+0.5, f'({pos_mm[0]:.0f},{pos_mm[1]:.0f})mm', 
+                        ha='center', fontsize=6, color='gray')
+        
+        # Draw paths
+        for robot in self.robots:
+            if robot['waypoints'] and len(robot['waypoints']) > 1:
+                px = [p[0] for p in robot['waypoints']]
+                py = [p[1] for p in robot['waypoints']]
+                self.ax.plot(px, py, '--', color=robot['color'], 
+                           linewidth=1.5, alpha=0.3, zorder=1)
+        
+        # Draw jobs
+        for job in self.jobs:
+            alpha = 0.3 if job['picked'] else 1.0
+            
+            box = FancyBboxPatch(
+                (job['pos'][0]-0.3, job['pos'][1]-0.3), 0.6, 0.6,
+                boxstyle="round,pad=0.05",
+                facecolor=job['color'], edgecolor='#333',
+                linewidth=2, alpha=alpha, zorder=3
+            )
+            self.ax.add_patch(box)
+            
+            self.ax.text(job['pos'][0], job['pos'][1], job['id'],
+                        ha='center', va='center', fontsize=7,
+                        fontweight='bold', color='white', zorder=4)
+            
+            if job['marker_id'] is not None:
+                self.ax.text(job['pos'][0], job['pos'][1]-0.5,
+                            f'ID{job["marker_id"]}', ha='center', fontsize=5, color='gray')
+            
+            if job['assigned_to'] is not None:
+                robot = self.robots[job['assigned_to']]
+                self.ax.text(job['pos'][0], job['pos'][1]+0.5,
+                           f'→{robot["id"]}', ha='center', 
+                           fontsize=6, color=robot['color'], fontweight='bold')
+        
+        # Draw robots
+        for robot in self.robots:
+            if robot.get('real_pos_mm'):
+                self.ax.text(robot['pos'][0], robot['pos'][1]-0.7,
+                            f'({robot["real_pos_mm"][0]:.0f},{robot["real_pos_mm"][1]:.0f})mm',
+                            ha='center', fontsize=5, color='gray')
+            
+            body = FancyBboxPatch(
+                (robot['pos'][0]-0.5, robot['pos'][1]-0.4), 1.0, 0.8,
+                boxstyle="round,pad=0.1",
+                facecolor=robot['color'], edgecolor='#2C3E50',
+                linewidth=2.5, zorder=5
+            )
+            self.ax.add_patch(body)
+            
+            self.ax.text(robot['pos'][0], robot['pos'][1], robot['id'],
+                        ha='center', va='center', fontsize=9,
+                        fontweight='bold', color='white', zorder=6)
+            
+            if robot['moving'] and np.linalg.norm(robot['velocity']) > 0.1:
+                vel_norm = np.array(robot['velocity'])
+                vel_norm = vel_norm / np.linalg.norm(vel_norm) * 0.6
+                arrow = FancyArrowPatch(
+                    (robot['pos'][0], robot['pos'][1]),
+                    (robot['pos'][0] + vel_norm[0], robot['pos'][1] + vel_norm[1]),
+                    arrowstyle='->', mutation_scale=20,
+                    color='white', linewidth=2.5, zorder=7
+                )
+                self.ax.add_patch(arrow)
+            else:
+                arrow = FancyArrowPatch(
+                    (robot['pos'][0], robot['pos'][1]),
+                    (robot['pos'][0] + 0.6, robot['pos'][1]),
+                    arrowstyle='->', mutation_scale=20,
+                    color='white', linewidth=2.5, zorder=7
+                )
+                self.ax.add_patch(arrow)
+        
+        robot_count = len(self.robots)
+        job_count = len(self.jobs)
+        self.ax.text(self.sim_width - 2, self.sim_height - 0.5,
+                    f'REAL-TIME: {"🟢 ACTIVE" if self.detector.running else "🔴 STOPPED"}\nRobots: {robot_count} | Jobs: {job_count}\nSTART: {"✅" if self.start_marker else "❌"}  END: {"✅" if self.end_marker else "❌"}',
+                    fontsize=8, fontweight='bold',
+                    color='green' if self.detector.running else 'red',
+                    ha='right', va='top')
+        
+        self.fig.canvas.draw_idle()
+    
+    def update_status(self):
+        status = f'Time: {self.simulation_time:.1f}s\n'
+        status += f'Robots: {len(self.robots)} | Jobs: {len(self.jobs)}\n'
+        status += f'START: {"✅" if self.start_marker else "❌"}  END: {"✅" if self.end_marker else "❌"}\n'
+        status += '─' * 35 + '\n'
+        
+        for robot in self.robots:
+            if robot.get('real_pos_mm'):
+                rx, ry = robot['real_pos_mm']
+                status += f'{robot["id"]}: {rx:.0f},{ry:.0f}mm\n'
+        
+        picked = sum(1 for j in self.jobs if j['picked'])
+        if self.jobs:
+            status += f'Picked: {picked}/{len(self.jobs)}'
+        
+        self.status_text.set_text(status)
+        self.fig.canvas.draw_idle()
+    
+    def run(self):
+        self.anim = FuncAnimation(self.fig, self.update_animation,
+                                 frames=None, interval=50, blit=False,
+                                 cache_frame_data=False)
+        
+        print("\n📷 Starting camera feed...")
+        print("   Press 'q' in the camera window to close it")
+        print("   The simulation will continue running")
+        
+        feed_thread = threading.Thread(target=self.detector.show_camera_feed)
+        feed_thread.daemon = True
+        feed_thread.start()
+        
+        plt.show()
+        
+        self.detector.stop_detection()
+
+
+# ============================================================
+# MAIN EXECUTION
+# ============================================================
+
+if __name__ == "__main__":
+    print("="*65)
+    print("DYNAMIC REAL-TIME MULTI-ROBOT SIMULATION")
+    print("="*65)
+    print("\n Features:")
+    print("  • Real-time ArUco marker detection")
+    print("  • Robots follow REAL positions from camera")
+    print("  • START (ID 10) detected in real-time")
+    print("  • END (ID 11) detected in real-time")
+    print("  • Jobs (IDs 20-21) detected in real-time")
+    print("  • ADD or REMOVE markers and see them update!")
+    print("\n" + "="*65)
+    
+    import glob
+    
+    cal_pattern = "F:/swarm_robots/codes/computer_vision/path_planning/motorola_calibration_*.npz"
+    cal_files = glob.glob(cal_pattern)
+    calibration_file = cal_files[0] if cal_files else None
+    
+    map_pattern = "F:/swarm_robots/codes/computer_vision/path_planning/workspace_map_*.json"
+    map_files = glob.glob(map_pattern)
+    map_file = sorted(map_files)[-1] if map_files else None
+    
+    if not map_file:
+        print("❌ No workspace map found!")
+        print("   Please run the real-time detector and save a map first")
+        exit()
+    
+    print(f"📁 Using map: {map_file}")
+    print(f"📁 Calibration: {calibration_file if calibration_file else 'None'}")
+    
+    sim = RealtimeMultiRobotSimulation(
+        map_file=map_file,
+        calibration_file=calibration_file
+    )
+    
+    sim.run()
